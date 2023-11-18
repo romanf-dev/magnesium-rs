@@ -5,26 +5,7 @@ use core::panic::PanicInfo;
 use core::ptr::read_volatile;
 use core::ptr::write_volatile;
 use core::convert::Infallible;
-use mg::mg::Queue;
-use mg::mg::Message;
-use mg::mg::Pool;
-use mg::mg::Actor;
-use mg::mg::Executor;
-
-#[panic_handler]
-fn panic(_info: &PanicInfo) -> ! {
-    loop {}
-}
-
-#[no_mangle]
-pub fn _exception() -> ! {
-    loop {}
-}
-
-#[no_mangle]
-pub fn _pendsv() -> ! {
-    loop {}
-}
+use mg::mg::{ Queue, Message, Pool, Actor, Executor };
 
 #[repr(C)]
 struct RCC {
@@ -75,8 +56,79 @@ const RCC_CFGR_SW_PLL: u32 = 2;
 const RCC_CFGR_PLLMULL9: u32 = 111 << 18;
 const RCC_CFGR_PLLSRC: u32 = 1 << 16;
 const RCC_CFGR_SWS_PLL: u32 = 8;
+
 const FLASH_ACR_PRFTBE: u32 = 1 << 4;
 const FLASH_ACR_LATENCY_1: u32 = 2 << 0;
+
+const GPIO_ADDR: usize = 0x40011000;
+const STIR_ADDR: usize = 0xe000ef00;
+const SYSTICK_ADDR: usize = 0xe000e010;
+const ISER0_ADDR: usize = 0xe000e100;
+
+#[panic_handler]
+fn panic(_info: &PanicInfo) -> ! {
+    loop {}
+}
+
+#[no_mangle]
+pub fn _exception() -> ! {
+    loop {}
+}
+
+#[no_mangle]
+pub fn _pendsv() -> ! {
+    loop {}
+}
+
+struct ExampleMsg {
+    n: u32
+}
+
+static POOL: Pool<ExampleMsg, 5> = Pool::new();
+static QUEUE: Queue<ExampleMsg> = Queue::new();
+static SCHED: Executor = Executor::new();
+
+fn led_control(state: bool) {
+    unsafe {
+        let gpio = &mut *(GPIO_ADDR as *mut GPIO);
+
+        if state {
+            write_volatile(&mut gpio.bsrr, GPIO_BSRR_BR13);
+        } else {
+            write_volatile(&mut gpio.bsrr, GPIO_BSRR_BS13);
+        }
+    }
+}
+
+async fn blinky() -> Infallible {
+    let q = &QUEUE;
+    loop {
+        let _ = q.await;        
+        led_control(true);
+        let _ = q.await;
+        led_control(false);
+    }
+}
+
+#[no_mangle]
+pub fn _systick() {
+    let mut msg = POOL.alloc().unwrap();
+    msg.n = 1;
+    QUEUE.put(msg);
+}
+
+#[no_mangle]
+pub fn _interrupt() {
+    SCHED.schedule(0);
+}
+
+#[no_mangle]
+pub fn interrupt_request(vect: u16) {
+    unsafe {    
+        let stir = &mut *(STIR_ADDR as *mut u32);
+        write_volatile(stir, vect as u32);
+    }
+}
 
 unsafe fn bit_set(addr: &mut u32, bits: u32) -> () {
     let value = read_volatile(addr);
@@ -87,57 +139,6 @@ unsafe fn bit_clear(addr: &mut u32, bits: u32) -> () {
     let value = read_volatile(addr);
     write_volatile(addr, value & !bits);
 }
-
-fn led_control(state: bool) {
-    unsafe {
-        let gpio = &mut *(0x40011000 as *mut GPIO);
-
-        if state {
-            write_volatile(&mut gpio.bsrr, GPIO_BSRR_BR13);
-        } else {
-            write_volatile(&mut gpio.bsrr, GPIO_BSRR_BS13);
-        }
-    }
-}
-
-struct ExampleMsg {
-    n: u32
-}
-
-static POOL1: Pool<ExampleMsg, 5> = Pool::new();
-static QUEUE1: Queue<ExampleMsg> = Queue::new();
-static SCHED: Executor = Executor::new();
-
-async fn blinky() -> Infallible {
-    loop {
-        let _ = (&QUEUE1).await;        
-        led_control(true);
-        let _ = (&QUEUE1).await;
-        led_control(false);
-    }
-}
-
-#[no_mangle]
-pub fn _systick() {
-    let mut msg = POOL1.alloc().unwrap();
-    msg.n = 1;
-    QUEUE1.put(msg);
-}
-
-#[no_mangle]
-pub fn _interrupt() {
-    SCHED.schedule(0);
-}
-
-#[no_mangle]
-pub fn interrupt_request(_vect: usize) {
-    unsafe {    
-        let stir = &mut *(0xe000ef00 as *mut u32);
-        write_volatile(stir, 0);
-    }
-}
-
-extern "C" { fn interrupt_mask(new_mask: usize); }
 
 #[no_mangle]
 pub fn _start() -> ! {
@@ -189,31 +190,31 @@ pub fn _start() -> ! {
         //
         // Enable IRQ0 to be used as actor's vector.
         //
-        let iser0 = &mut *(0xe000e100 as *mut u32);
+        let iser0 = &mut *(ISER0_ADDR as *mut u32);
         write_volatile(iser0, 1);
 
         //
         // Configure the LED.
         //
-        let gpio = &mut *(0x40011000 as *mut GPIO);
+        let gpio = &mut *(GPIO_ADDR as *mut GPIO);
         bit_set(&mut rcc.apb2enr, RCC_APB2ENR_IOPCEN);
         bit_set(&mut gpio.crh, GPIO_CRH_CNF13_0 | GPIO_CRH_MODE13_1);
 
-        const PROTO1: Message<ExampleMsg> = Message::new(ExampleMsg { n: 0 });
-        static mut ARR1: [Message<ExampleMsg>; 5] = [PROTO1; 5];
-        static mut ACTOR1: Actor = Actor::new(0, 0);
-
-        QUEUE1.init();
-        let mut future = blinky();
-
-        POOL1.init(&mut ARR1);
-
-        let systick = &mut *(0xe000e010 as *mut SysTick);
-        write_volatile(&mut systick.load, 72000 * 150);
+        let systick = &mut *(SYSTICK_ADDR as *mut SysTick);
+        write_volatile(&mut systick.load, 72000 * 100);
         write_volatile(&mut systick.val, 0);
         write_volatile(&mut systick.ctrl, 7);
+    }
+    
+    const PROTO: Message<ExampleMsg> = Message::new(ExampleMsg { n: 0 });
+    static mut MSGS: [Message<ExampleMsg>; 5] = [PROTO; 5];
+    static mut ACTOR: Actor = Actor::new(0, 0);
 
-        SCHED.run([(&mut ACTOR1, &mut future)]);
+    QUEUE.init();
+    let mut future = blinky();
+
+    unsafe {
+        POOL.init(&mut MSGS);
+        SCHED.run([(&mut ACTOR, &mut future)]);
     }
 }
-

@@ -82,6 +82,7 @@ init_bss:
   bne   init_bss
         
 image_init_done:
+  cpsid i
   b _start
 
 .global RESET_Handler
