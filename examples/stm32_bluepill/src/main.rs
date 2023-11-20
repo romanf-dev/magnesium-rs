@@ -84,7 +84,7 @@ struct ExampleMsg {
     n: u32
 }
 
-static POOL: Pool<ExampleMsg, 5> = Pool::new();
+static POOL: Pool<ExampleMsg> = Pool::new();
 static QUEUE: Queue<ExampleMsg> = Queue::new();
 static SCHED: Executor = Executor::new();
 
@@ -200,6 +200,9 @@ pub fn _start() -> ! {
         bit_set(&mut rcc.apb2enr, RCC_APB2ENR_IOPCEN);
         bit_set(&mut gpio.crh, GPIO_CRH_CNF13_0 | GPIO_CRH_MODE13_1);
 
+        //
+        // Configure SysTick for 100ms period.
+        //
         let systick = &mut *(SYSTICK_ADDR as *mut SysTick);
         write_volatile(&mut systick.load, 72000 * 100);
         write_volatile(&mut systick.val, 0);
