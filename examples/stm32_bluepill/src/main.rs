@@ -50,10 +50,10 @@ const RCC_CR_HSION: u32 = 1 << 0;
 const RCC_CR_HSEON: u32 = 1 << 16;
 const RCC_CR_HSERDY: u32 = 1 << 17;
 const RCC_CR_PLLON: u32 = 1 << 24;
-const RCC_CR_PLLRDY: u32 = 1<<25;
+const RCC_CR_PLLRDY: u32 = 1 << 25;
 const RCC_CFGR_SW_HSE: u32 = 1;
 const RCC_CFGR_SW_PLL: u32 = 2;
-const RCC_CFGR_PLLMULL9: u32 = 111 << 18;
+const RCC_CFGR_PLLMULL9: u32 = 7 << 18;
 const RCC_CFGR_PLLSRC: u32 = 1 << 16;
 const RCC_CFGR_SWS_PLL: u32 = 8;
 
