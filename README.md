@@ -1,10 +1,12 @@
 Simple hardware-assisted actor model implementation in Rust
 ===========================================================
 
+DRAFT
+
 Overview
 --------
 
-The framework relies on hardware features of the NVIC interrupt controller: the ability to set user-defined priorities to IRQs and possibility to trigger interrupts programmatically. Actor's priorities are mapped to interrupt vectors and interrupt controller acts as a hardware scheduler. Therefore, interrupts are used as 'execution engine' for actors with certain priority.
+The framework relies on hardware features of the NVIC interrupt controller: the ability to set user-defined priorities to IRQs and possibility to trigger interrupts programmatically. Actor's priorities are mapped to interrupt vectors and interrupt controller acts as a hardware scheduler. Therefore, interrupts are used as 'execution engine' for actors with certain priority. The idea is to re-use unused IRQ vectors as application actors.
 
 When some event (hardware interrupt) occurs, it allocates and posts the message to a queue, this causes activation of the subscribed actor, moving the message into its incoming mailbox, moving the actor to the list of ready ones and also triggering interrupt vector corresponding to actor's priority. The hardware automatically transfers control to the activated vector, its handler then calls framework's function 'schedule' which eventually calls activated actors.
 
@@ -79,7 +81,7 @@ Finally, there is executor (or scheduler) representing the set of ready-to-run a
         static SCHED: Executor = Executor::new();
 
 
-It should be called inside interrupt handlers designated to actor's execution:
+It should be initialized once on startup and then called inside interrupt handlers designated to actor's execution:
 
         SCHED.schedule(...<the current interrupt vector number>...);
 
@@ -98,6 +100,31 @@ The main function should contain scheduler launch as its last statement:
 
 
 Note that this function expects disabled interrupts and panics in case when they are enabled since this may lead to undefined behavior.
+
+The framework also provides timer facility. All software timers are handled by single global timer object representing tick source.
+
+        static TIMER: Timer< ...number of hierarchy levels ...> = Timer::new();
+
+
+Timers form a hierarchy based on their timeout value. Default value is 10. After the global context is initialized in the main using init method:
+
+        TIMER.init();
+
+
+then some interrupt must provide periodic ticks using tick function:
+
+        TIMER.tick();
+
+
+After that any actor may use sleep_for method with given amount of ticks to sleep:
+
+        loop {
+            ...
+            TIMER.sleep_for(10).await; // Sleep for 10 ticks.
+        }
+
+
+Tick duration is unspecified and depends on your settings.
 That's it. See example folder for detailed descriptions.
 
 
@@ -112,5 +139,5 @@ not return and all the actors are infinite loops this is considered safe.
 Demo
 ----
 
-The demo is a toy example with just one actor which blinks the LED on the STM32 Bluepill board (STM32F1 chip). Use 'make' to build.
+The demos is a toy examples with just one actor which blinks the LED. Use 'make' to build.
 
