@@ -12,7 +12,6 @@ use core::marker::PhantomData;
 use core::any::Any;
 use core::cell::{Cell, OnceCell};
 use core::ops::{Deref, DerefMut};
-use core::sync::atomic::{AtomicUsize, Ordering};
 use core::convert::Infallible;
 
 #[cfg(not(test))] /* Tests provide their own stubs for interrupt masking. */
@@ -114,14 +113,11 @@ impl<'a, T: Linkable> List<'a, T> {
     }
 
     fn peek_head_node(&self) -> Option<&Node<T>> {
-        match self.root.links.get() {
-            Some((_, next)) =>
-                if next != &self.root {
-                    unsafe { Some(&*next) }
-                } else {
-                    None
-                },
-            _ => None
+        let (_, next) = self.root.links.get().unwrap();
+        if next != &self.root {
+            unsafe { Some(&*next) }
+        } else {
+            None
         }
     }
 
@@ -286,6 +282,107 @@ impl<'a: 'static, T: Sized> Pool<'a, T> {
     }
 }
 
+type GrayInt = usize;
+
+pub struct Timer<'a, const N: usize> {
+    timers: [List<'a, Actor>; N],
+    ticks_gray: Cell<GrayInt>,
+    ticks: Cell<usize>
+}
+
+pub struct TimeoutFuture<'a, const N: usize> {
+    container: Option<&'a Timer<'a, N>>,
+    timeout: GrayInt
+}
+
+impl<'a: 'static, const N: usize> Timer<'a, N> {
+    const TIMQ_PROTO: List<'a, Actor> = List::new();
+    
+    pub const fn new() -> Self {
+        Self {
+            timers: [Self::TIMQ_PROTO; N],
+            ticks_gray: Cell::new(0),
+            ticks: Cell::new(0)
+        }
+    }
+    
+    pub fn init(&self) {
+        for i in 0..N {
+            self.timers[i].init()
+        }
+    }
+    
+    fn to_gray(x: usize) -> usize {
+        x ^ (x >> 1)
+    }
+    
+    fn diff_msb(x: usize, y: usize) -> usize {
+        assert!(x != y);
+        let xor = x ^ y;
+        let msb = (usize::BITS - xor.leading_zeros() - 1) as usize;
+        if msb < N {
+            msb
+        } else {
+            N - 1
+        }
+    }
+    
+    fn subscribe(&self, timeout: GrayInt, actor: Ref<'a, Actor>) {
+        let _lock = CriticalSection::new();
+        let current = self.ticks_gray.get();
+        let qindex = Self::diff_msb(current, timeout);
+        self.timers[qindex].enqueue(actor);
+    }
+    
+    pub fn tick(&self) {
+        let _lock = CriticalSection::new();
+        let old_tick = self.ticks.get();
+        let old_gray = self.ticks_gray.get();
+        let new_tick = old_tick + 1;
+        let new_gray = Self::to_gray(new_tick);
+        self.ticks.set(new_tick);
+        self.ticks_gray.set(new_gray);
+        let qindex = Self::diff_msb(old_gray, new_gray);
+        
+        while let Some(actor) = self.timers[qindex].dequeue() {
+            let t = actor.0.timeout.as_ref().unwrap();
+            if *t == new_gray {
+                actor.0.timeout = None;
+                let exec = actor.0.context.take().unwrap();
+                exec.activate(actor.0.prio, actor.0.vect, actor);               
+            } else {
+                let qnext = Self::diff_msb(*t, new_gray);
+                self.timers[qnext].enqueue(actor);
+            }
+        }
+    }
+    
+    pub fn sleep_for(&'a self, t: u32) -> TimeoutFuture<'a, N> {
+        assert!(t != 0);
+        let _lock = CriticalSection::new();
+        let tout = self.ticks.get() + (t as usize);
+        TimeoutFuture {
+            container: Some(self),
+            timeout: Self::to_gray(tout)
+        }
+    }   
+}
+
+impl<'a: 'static, const N: usize> Future for TimeoutFuture<'a, N> {
+    type Output = ();
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+        let actor_ptr = cx.waker().as_raw().data() as *mut Actor;
+        let actor = unsafe { &mut *actor_ptr };
+        actor.timeout = Some(self.timeout);
+        if let Some(timer) = self.container.take() {
+            timer.subscribe(self.timeout, Ref::new(actor));
+            Poll::Pending
+        } else {
+            Poll::Ready(())
+        }
+    }
+}
+
 type DynFuture = dyn Future<Output=Infallible> + 'static;
 type PinnedFuture = Pin<&'static mut DynFuture>;
 
@@ -293,6 +390,7 @@ pub struct Actor {
     prio: u8,
     vect: u16,
     future_id: OnceCell<usize>,
+    timeout: Option<GrayInt>,
     mailbox: Option<&'static mut dyn Any>,
     context: Option<&'static Executor<'static>>,
     linkage: Node<Self>
@@ -321,6 +419,7 @@ impl Actor {
             prio: p,
             vect: v,
             future_id: OnceCell::new(),
+            timeout: None,
             mailbox: None,
             context: None,
             linkage: Node::new()
@@ -331,7 +430,7 @@ impl Actor {
         let ptr: *mut Actor = self;
         let raw_waker = noop_raw_waker(ptr);
         let waker = unsafe { Waker::from_raw(raw_waker) };
-        let mut cx = core::task::Context::from_waker(&waker);
+        let mut cx = Context::from_waker(&waker);
         let future = f.get_mut().unwrap();
         let _ = future.as_mut().poll(&mut cx);
     }
@@ -386,7 +485,7 @@ impl<'a, T> ArrayAccessor<'a, T> {
 pub struct Executor<'a> {
     runq: [List<'a, Actor>; NPRIO as usize ],
     futures: OnceCell<ArrayAccessor<'a, OnceCell<PinnedFuture>>>,
-    ticket: AtomicUsize
+    ticket: Cell<usize>
 }
 
 impl<'a: 'static> Executor<'a> {
@@ -398,7 +497,7 @@ impl<'a: 'static> Executor<'a> {
         Self {
             runq: [ RUNQ_PROTO; Self::NPRIO_USIZE ],
             futures: OnceCell::new(),
-            ticket: AtomicUsize::new(0)
+            ticket: Cell::new(0)
         }
     }
 
@@ -439,7 +538,8 @@ impl<'a: 'static> Executor<'a> {
     unsafe fn spawn(&'a self, actor: &mut Actor, f: &mut DynFuture) {
         let static_fut = Self::into_static(f);
         let pinned_fut = Pin::new_unchecked(static_fut);
-        let fut_id = self.ticket.fetch_add(1, Ordering::Relaxed);
+        let fut_id = self.ticket.get();
+        self.ticket.set(fut_id + 1);
         let futures_arr = self.futures.get().unwrap();
         let future = futures_arr.as_mut_item(fut_id);
         future.set(pinned_fut).ok().unwrap();
@@ -473,6 +573,7 @@ impl<'a: 'static> Executor<'a> {
 unsafe impl Sync for Executor<'_> {}
 unsafe impl<T: Send> Sync for Queue<'_, T> {}
 unsafe impl<T: Send> Sync for Pool<'_, T> {}
+unsafe impl<const N: usize> Sync for Timer<'_, N> {}
 
 //----------------------------------------------------------------------------
 
@@ -492,6 +593,8 @@ struct ExampleMsg {
     n: u32
 }
 
+static TIMER: Timer<10> = Timer::new();
+
 async fn proxy(q1: &MsgQueue, q2: &MsgQueue) -> Infallible {
     loop {
         let msg = q1.await;
@@ -504,6 +607,8 @@ async fn adder(q1: &MsgQueue, sum: &mut u32) -> Infallible {
     loop {
         let msg = q1.await;
         println!("adder got {}", msg.n);
+        TIMER.sleep_for(100).await;
+        println!("woken up");
         *sum += msg.n;
     }
 }
@@ -524,6 +629,7 @@ fn main() {
 
     QUEUE1.init();
     QUEUE2.init();
+    TIMER.init();
 
     let mut f1 = proxy(&QUEUE1, &QUEUE2);
     let mut f2 = adder(&QUEUE2, unsafe {&mut SUM});
@@ -541,6 +647,12 @@ fn main() {
         let mut msg = POOL.alloc().unwrap();
         msg.n = 1;
         QUEUE1.put(msg);
+        SCHED.schedule(0);
+        
+        for _ in 0..100 {
+            TIMER.tick();
+        }
+        
         SCHED.schedule(0);
     }
 
