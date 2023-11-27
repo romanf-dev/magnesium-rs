@@ -13,6 +13,7 @@ use core::any::Any;
 use core::cell::{Cell, OnceCell};
 use core::ops::{Deref, DerefMut};
 use core::convert::Infallible;
+use core::cmp::min;
 
 #[cfg(not(test))] /* Tests provide their own stubs for interrupt masking. */
 extern "C" {
@@ -282,27 +283,24 @@ impl<'a: 'static, T: Sized> Pool<'a, T> {
     }
 }
 
-type GrayInt = usize;
+type GrayCode = usize;
 
 pub struct Timer<'a, const N: usize> {
     timers: [List<'a, Actor>; N],
-    ticks_gray: Cell<GrayInt>,
-    ticks: Cell<usize>
+    ticks: Cell<(usize, GrayCode)>
 }
 
 pub struct TimeoutFuture<'a, const N: usize> {
     container: Option<&'a Timer<'a, N>>,
-    timeout: GrayInt
+    delay: usize
 }
 
 impl<'a: 'static, const N: usize> Timer<'a, N> {
-    const TIMQ_PROTO: List<'a, Actor> = List::new();
-    
     pub const fn new() -> Self {
+        const TIMQ_PROTO: List<'static, Actor> = List::new();
         Self {
-            timers: [Self::TIMQ_PROTO; N],
-            ticks_gray: Cell::new(0),
-            ticks: Cell::new(0)
+            timers: [TIMQ_PROTO; N],
+            ticks: Cell::new((0, 0))
         }
     }
     
@@ -317,53 +315,45 @@ impl<'a: 'static, const N: usize> Timer<'a, N> {
     }
     
     fn diff_msb(x: usize, y: usize) -> usize {
-        assert!(x != y);
+        assert!(x != y); /* Since x != y, at least one bit is different. */
         let xor = x ^ y;
         let msb = (usize::BITS - xor.leading_zeros() - 1) as usize;
-        if msb < N {
-            msb
-        } else {
-            N - 1
-        }
+        min(msb, N - 1)
     }
     
-    fn subscribe(&self, timeout: GrayInt, actor: Ref<'a, Actor>) {
+    fn subscribe(&self, delay: usize, actor: Ref<'a, Actor>) {
         let _lock = CriticalSection::new();
-        let current = self.ticks_gray.get();
-        let qindex = Self::diff_msb(current, timeout);
+        let (ticks, gray_ticks) = self.ticks.get();
+        let gray_tout = Self::to_gray(ticks + delay);
+        let qindex = Self::diff_msb(gray_ticks, gray_tout);
+        actor.0.timeout = Some(gray_tout);
         self.timers[qindex].enqueue(actor);
-    }
+    } 
     
     pub fn tick(&self) {
         let _lock = CriticalSection::new();
-        let old_tick = self.ticks.get();
-        let old_gray = self.ticks_gray.get();
-        let new_tick = old_tick + 1;
-        let new_gray = Self::to_gray(new_tick);
-        self.ticks.set(new_tick);
-        self.ticks_gray.set(new_gray);
-        let qindex = Self::diff_msb(old_gray, new_gray);
-        
+        let (old_tick, old_gray) = self.ticks.get();
+        let new_ticks = (old_tick + 1, Self::to_gray(old_tick + 1));
+        let qindex = Self::diff_msb(old_gray, new_ticks.1);
+        self.ticks.set(new_ticks);
+
         while let Some(actor) = self.timers[qindex].dequeue() {
             let t = actor.0.timeout.as_ref().unwrap();
-            if *t == new_gray {
+            if *t == new_ticks.1 {
                 actor.0.timeout = None;
                 let exec = actor.0.context.take().unwrap();
                 exec.activate(actor.0.prio, actor.0.vect, actor);               
             } else {
-                let qnext = Self::diff_msb(*t, new_gray);
+                let qnext = Self::diff_msb(*t, new_ticks.1);
                 self.timers[qnext].enqueue(actor);
             }
         }
     }
     
     pub fn sleep_for(&'a self, t: u32) -> TimeoutFuture<'a, N> {
-        assert!(t != 0);
-        let _lock = CriticalSection::new();
-        let tout = self.ticks.get() + (t as usize);
         TimeoutFuture {
             container: Some(self),
-            timeout: Self::to_gray(tout)
+            delay: t as usize
         }
     }   
 }
@@ -373,10 +363,13 @@ impl<'a: 'static, const N: usize> Future for TimeoutFuture<'a, N> {
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
         let actor_ptr = cx.waker().as_raw().data() as *mut Actor;
         let actor = unsafe { &mut *actor_ptr };
-        actor.timeout = Some(self.timeout);
         if let Some(timer) = self.container.take() {
-            timer.subscribe(self.timeout, Ref::new(actor));
-            Poll::Pending
+            if self.delay != 0 {
+                timer.subscribe(self.delay, Ref::new(actor));
+                Poll::Pending
+            } else {
+                Poll::Ready(())
+            }
         } else {
             Poll::Ready(())
         }
@@ -390,7 +383,7 @@ pub struct Actor {
     prio: u8,
     vect: u16,
     future_id: OnceCell<usize>,
-    timeout: Option<GrayInt>,
+    timeout: Option<GrayCode>,
     mailbox: Option<&'static mut dyn Any>,
     context: Option<&'static Executor<'static>>,
     linkage: Node<Self>
@@ -566,7 +559,7 @@ impl<'a: 'static> Executor<'a> {
             let prev_mask = interrupt_mask(0);
             assert!(prev_mask == 1);
         }
-        loop {}
+        loop {} /* TODO: sleep... */
     }
 }
 
@@ -574,8 +567,6 @@ unsafe impl Sync for Executor<'_> {}
 unsafe impl<T: Send> Sync for Queue<'_, T> {}
 unsafe impl<T: Send> Sync for Pool<'_, T> {}
 unsafe impl<const N: usize> Sync for Timer<'_, N> {}
-
-//----------------------------------------------------------------------------
 
 #[cfg(test)]
 fn interrupt_mask(_: u8) -> u8 { 0 }
@@ -586,19 +577,14 @@ fn interrupt_request(_: u16) {}
 #[cfg(test)]
 mod tests {
 use super::*;
-
 type MsgQueue = Queue<'static, ExampleMsg>;
-
-struct ExampleMsg {
-    n: u32
-}
-
+struct ExampleMsg(u32);
 static TIMER: Timer<10> = Timer::new();
 
 async fn proxy(q1: &MsgQueue, q2: &MsgQueue) -> Infallible {
     loop {
         let msg = q1.await;
-        println!("proxy got {}", msg.n);
+        println!("proxy got {}", msg.0);
         q2.put(msg);
     }
 }
@@ -606,23 +592,22 @@ async fn proxy(q1: &MsgQueue, q2: &MsgQueue) -> Infallible {
 async fn adder(q1: &MsgQueue, sum: &mut u32) -> Infallible {
     loop {
         let msg = q1.await;
-        println!("adder got {}", msg.n);
+        println!("adder got {}", msg.0);
         TIMER.sleep_for(100).await;
         println!("woken up");
-        *sum += msg.n;
+        *sum += msg.0;
     }
 }
 
 #[test]
 fn main() {
-    const MSG_PROTO: Message<ExampleMsg> = Message::new(ExampleMsg { n: 0 });
+    const MSG_PROTO: Message<ExampleMsg> = Message::new(ExampleMsg(0));
     static mut MSG_STORAGE: [Message<ExampleMsg>; 5] = [MSG_PROTO; 5];
 
     static POOL: Pool<ExampleMsg> = Pool::new();
     static QUEUE1: Queue<ExampleMsg> = Queue::new();
     static QUEUE2: Queue<ExampleMsg> = Queue::new();
     static SCHED: Executor = Executor::new();
-
     static mut ACTOR1: Actor = Actor::new(0, 0);
     static mut ACTOR2: Actor = Actor::new(0, 1);
     static mut SUM: u32 = 0;
@@ -630,7 +615,6 @@ fn main() {
     QUEUE1.init();
     QUEUE2.init();
     TIMER.init();
-
     let mut f1 = proxy(&QUEUE1, &QUEUE2);
     let mut f2 = adder(&QUEUE2, unsafe {&mut SUM});
     
@@ -645,7 +629,7 @@ fn main() {
 
     for _ in 0..10 {
         let mut msg = POOL.alloc().unwrap();
-        msg.n = 1;
+        msg.0 = 1;
         QUEUE1.put(msg);
         SCHED.schedule(0);
         

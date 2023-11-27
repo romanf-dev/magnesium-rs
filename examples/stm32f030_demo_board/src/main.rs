@@ -96,9 +96,9 @@ fn led_control(state: bool) {
 
 async fn blinky() -> Infallible {
     loop {
-        let _ = TIMER.sleep_for(10).await;
+        let _ = TIMER.sleep_for(50).await;
         led_control(true);
-        let _ = TIMER.sleep_for(10).await;
+        let _ = TIMER.sleep_for(50).await;
         led_control(false);
     }
 }
@@ -199,7 +199,7 @@ pub fn _start() -> ! {
         // Configure SysTick for 100ms period.
         //
         let systick = &mut *(SYSTICK_ADDR as *mut SysTick);
-        write_volatile(&mut systick.load, 48000u32 * 100);
+        write_volatile(&mut systick.load, 48000u32);
         write_volatile(&mut systick.val, 0);
         write_volatile(&mut systick.ctrl, 7);
     }
