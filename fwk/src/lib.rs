@@ -356,7 +356,6 @@ impl<'a: 'static, const N: usize> Timer<'a, N> {
                 self.timers[qnext].enqueue(actor);
                 self.qlen[qnext].set(self.qlen[qnext].get() + 1);
             }
-            /*TODO: interrupt window.*/
         }
     }
     
