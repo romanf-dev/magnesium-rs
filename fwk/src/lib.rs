@@ -268,6 +268,14 @@ impl<'a: 'static, T: Sized> Pool<'a, T> {
         self.slice.set(Some(&mut arr[0..N]));
     }
 
+    pub async fn get(&'a self) -> Envelope<'a, T> {
+        if let Some(msg) = self.alloc() {
+            msg
+        } else {
+            (&self.pool).await
+        }
+    }
+
     pub fn alloc(&'a self) -> Option<Envelope<'a, T>> {
         let _lock = CriticalSection::new();
         if let Some(slice) = self.slice.take() {
@@ -283,11 +291,10 @@ impl<'a: 'static, T: Sized> Pool<'a, T> {
     }
 }
 
-type GrayCode = usize;
-
 pub struct Timer<'a, const N: usize> {
     timers: [List<'a, Actor>; N],
-    ticks: Cell<(usize, GrayCode)>
+    qlen: [Cell<usize>; N],
+    ticks: Cell<usize>
 }
 
 pub struct TimeoutFuture<'a, const N: usize> {
@@ -298,9 +305,11 @@ pub struct TimeoutFuture<'a, const N: usize> {
 impl<'a: 'static, const N: usize> Timer<'a, N> {
     pub const fn new() -> Self {
         const TIMQ_PROTO: List<'static, Actor> = List::new();
+        const ZERO_LEN: Cell<usize> = Cell::new(0);
         Self {
             timers: [TIMQ_PROTO; N],
-            ticks: Cell::new((0, 0))
+            qlen: [ZERO_LEN; N],
+            ticks: Cell::new(0)
         }
     }
     
@@ -309,11 +318,7 @@ impl<'a: 'static, const N: usize> Timer<'a, N> {
             self.timers[i].init()
         }
     }
-    
-    fn to_gray(x: usize) -> usize {
-        x ^ (x >> 1)
-    }
-    
+
     fn diff_msb(x: usize, y: usize) -> usize {
         assert!(x != y); /* Since x != y, at least one bit is different. */
         let xor = x ^ y;
@@ -323,30 +328,35 @@ impl<'a: 'static, const N: usize> Timer<'a, N> {
     
     fn subscribe(&self, delay: usize, actor: Ref<'a, Actor>) {
         let _lock = CriticalSection::new();
-        let (ticks, gray_ticks) = self.ticks.get();
-        let gray_tout = Self::to_gray(ticks + delay);
-        let qindex = Self::diff_msb(gray_ticks, gray_tout);
-        actor.0.timeout = Some(gray_tout);
+        let ticks = self.ticks.get();
+        let timeout = ticks + delay;
+        actor.0.timeout = Some(timeout);
+        let qindex = Self::diff_msb(ticks, timeout);
         self.timers[qindex].enqueue(actor);
+        self.qlen[qindex].set(self.qlen[qindex].get() + 1);
     } 
     
     pub fn tick(&self) {
         let _lock = CriticalSection::new();
-        let (old_tick, old_gray) = self.ticks.get();
-        let new_ticks = (old_tick + 1, Self::to_gray(old_tick + 1));
-        let qindex = Self::diff_msb(old_gray, new_ticks.1);
+        let old_ticks = self.ticks.get();
+        let new_ticks = old_ticks + 1;
+        let qindex = Self::diff_msb(old_ticks, new_ticks);
         self.ticks.set(new_ticks);
+        let len = self.qlen[qindex].replace(0);
 
-        while let Some(actor) = self.timers[qindex].dequeue() {
+        for _ in 0..len {
+            let actor = self.timers[qindex].dequeue().unwrap();
             let t = actor.0.timeout.as_ref().unwrap();
-            if *t == new_ticks.1 {
+            if *t == new_ticks {
                 actor.0.timeout = None;
                 let exec = actor.0.context.take().unwrap();
                 exec.activate(actor.0.prio, actor.0.vect, actor);               
             } else {
-                let qnext = Self::diff_msb(*t, new_ticks.1);
+                let qnext = Self::diff_msb(*t, new_ticks);
                 self.timers[qnext].enqueue(actor);
+                self.qlen[qnext].set(self.qlen[qnext].get() + 1);
             }
+            /*TODO: interrupt window.*/
         }
     }
     
@@ -355,7 +365,7 @@ impl<'a: 'static, const N: usize> Timer<'a, N> {
             container: Some(self),
             delay: t as usize
         }
-    }   
+    }
 }
 
 impl<'a: 'static, const N: usize> Future for TimeoutFuture<'a, N> {
@@ -383,7 +393,7 @@ pub struct Actor {
     prio: u8,
     vect: u16,
     future_id: OnceCell<usize>,
-    timeout: Option<GrayCode>,
+    timeout: Option<usize>,
     mailbox: Option<&'static mut dyn Any>,
     context: Option<&'static Executor<'static>>,
     linkage: Node<Self>
@@ -580,12 +590,16 @@ use super::*;
 type MsgQueue = Queue<'static, ExampleMsg>;
 struct ExampleMsg(u32);
 static TIMER: Timer<10> = Timer::new();
+static POOL: Pool<ExampleMsg> = Pool::new();
 
-async fn proxy(q1: &MsgQueue, q2: &MsgQueue) -> Infallible {
+async fn proxy(q1: &MsgQueue) -> Infallible {
     loop {
-        let msg = q1.await;
-        println!("proxy got {}", msg.0);
-        q2.put(msg);
+        TIMER.sleep_for(100).await;
+        println!("woken up");
+        let mut msg = POOL.get().await;
+        println!("alloc");
+        msg.0 = 1;
+        q1.put(msg);
     }
 }
 
@@ -593,8 +607,6 @@ async fn adder(q1: &MsgQueue, sum: &mut u32) -> Infallible {
     loop {
         let msg = q1.await;
         println!("adder got {}", msg.0);
-        TIMER.sleep_for(100).await;
-        println!("woken up");
         *sum += msg.0;
     }
 }
@@ -604,23 +616,19 @@ fn main() {
     const MSG_PROTO: Message<ExampleMsg> = Message::new(ExampleMsg(0));
     static mut MSG_STORAGE: [Message<ExampleMsg>; 5] = [MSG_PROTO; 5];
 
-    static POOL: Pool<ExampleMsg> = Pool::new();
     static QUEUE1: Queue<ExampleMsg> = Queue::new();
-    static QUEUE2: Queue<ExampleMsg> = Queue::new();
     static SCHED: Executor = Executor::new();
     static mut ACTOR1: Actor = Actor::new(0, 0);
     static mut ACTOR2: Actor = Actor::new(0, 1);
     static mut SUM: u32 = 0;
 
+    POOL.init(unsafe {&mut MSG_STORAGE});
     QUEUE1.init();
-    QUEUE2.init();
     TIMER.init();
-    let mut f1 = proxy(&QUEUE1, &QUEUE2);
-    let mut f2 = adder(&QUEUE2, unsafe {&mut SUM});
+    let mut f1 = proxy(&QUEUE1);
+    let mut f2 = adder(&QUEUE1, unsafe {&mut SUM});
     
     unsafe {
-        POOL.init(&mut MSG_STORAGE);
-        
         static mut FUTURES: [OnceCell<PinnedFuture>; 2] = [Executor::EMPTY_CELL; 2];
         SCHED.init(FUTURES.as_mut_slice());
         SCHED.spawn(&mut ACTOR1, &mut f1);
@@ -628,11 +636,6 @@ fn main() {
     }
 
     for _ in 0..10 {
-        let mut msg = POOL.alloc().unwrap();
-        msg.0 = 1;
-        QUEUE1.put(msg);
-        SCHED.schedule(0);
-        
         for _ in 0..100 {
             TIMER.tick();
         }
