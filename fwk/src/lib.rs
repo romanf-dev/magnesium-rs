@@ -12,7 +12,7 @@ use core::marker::PhantomData;
 use core::any::Any;
 use core::cell::{Cell, OnceCell};
 use core::ops::{Deref, DerefMut};
-use core::convert::Infallible;
+use core::convert::{Into, Infallible};
 use core::cmp::min;
 
 pub const NPRIO: u8 = 16; /* Number of available hw priorities. */
@@ -95,7 +95,7 @@ impl<T> Node<T> {
         }
     }
 
-    fn to_obj<'a>(&self) -> Ref<'a, T> {
+    fn to_object<'a>(&self) -> Ref<'a, T> {
         let ptr = self.payload.take().unwrap();
         unsafe { Ref::new(&mut *ptr) }
     }
@@ -152,7 +152,7 @@ impl<'a, T: Linkable> List<'a, T> {
     fn dequeue(&self) -> Option<Ref<'a, T>> {
         if let Some(node) = self.peek_head_node() {
             node.unlink();
-            Some(node.to_obj())
+            Some(node.to_object())
         } else {
             None
         }
@@ -160,7 +160,7 @@ impl<'a, T: Linkable> List<'a, T> {
 }
 
 pub struct Message<'a, T> {
-    parent: OnceCell<&'a Queue<'a, T>>,
+    parent: Option<&'a Queue<'a, T>>,
     linkage: Node<Self>,
     payload: T
 }
@@ -168,7 +168,7 @@ pub struct Message<'a, T> {
 impl<'a, T> Message<'a, T> {
     pub const fn new(data: T) -> Self {
         Self {
-            parent: OnceCell::new(),
+            parent: None,
             linkage: Node::new(),
             payload: data
         }
@@ -183,7 +183,7 @@ impl<'a, T> Linkable for Message<'a, T> {
 
 type MsgRef<'a, T> = Ref<'a, Message<'a, T>>;
 
-pub struct Envelope<'a: 'static, T> {   /* User-exposed msg with Drop impl. */
+pub struct Envelope<'a: 'static, T> {   /* Msg wrapper with Drop impl. */
     content: Option<MsgRef<'a, T>>
 }
 
@@ -193,8 +193,10 @@ impl<'a, T> Envelope<'a, T> {
             content: Some(msg)
         }
     }
+}
 
-    fn into_wrapper(mut self) -> MsgRef<'a, T> {
+impl<'a, T> Into<MsgRef<'a, T>> for Envelope<'a, T> {
+    fn into(mut self) -> MsgRef<'a, T> {
         self.content.take().unwrap()
     }
 }
@@ -217,7 +219,7 @@ impl<'a, T> DerefMut for Envelope<'a, T> {
 impl<'a, T> Drop for Envelope<'a, T> {
     fn drop(&mut self) {
         if let Some(msg) = self.content.take() {
-            let parent = msg.0.parent.get().unwrap();
+            let parent = msg.0.parent.as_ref().unwrap();
             parent.put_internal(msg);
         }
     }
@@ -257,12 +259,13 @@ impl<'a: 'static, T: Sized> Queue<'a, T> {
             self.msgs.enqueue(msg);
         } else {
             let actor = self.subscribers.dequeue().unwrap();
-            Actor::set(actor, msg);
+            actor.0.mailbox = Some(msg.release());
+            Actor::resume(actor);
         }
     }
 
     pub fn put(&self, msg: Envelope<'a, T>) {
-        self.put_internal(msg.into_wrapper())
+        self.put_internal(msg.into())
     }
 }
 
@@ -299,7 +302,7 @@ impl<'a: 'static, T: Sized> Pool<'a, T> {
             if rest.len() > 0 {
                 self.slice.set(Some(rest));
             }
-            item.parent.set(&self.pool).ok().unwrap();
+            item.parent = Some(&self.pool);
             Some(Envelope::new(Ref::new(item)))
         } else {
             self.pool.msgs.dequeue().map(Envelope::new)
@@ -309,7 +312,7 @@ impl<'a: 'static, T: Sized> Pool<'a, T> {
 
 pub struct Timer<'a, const N: usize> {
     timers: [List<'a, Actor>; N],
-    len: [Cell<usize>; N], /* Length of corresponding timer queue. */
+    len: [Cell<usize>; N], /* Length of the corresponding timer queue. */
     ticks: Cell<usize>
 }
 
@@ -322,7 +325,7 @@ impl<'a: 'static, const N: usize> Timer<'a, N> {
     pub const fn new() -> Self {
         const ZERO: Cell<usize> = Cell::new(0);
         Self {
-            timers: [List::<Actor>::UNINITIALIZED; N],
+            timers: [List::UNINITIALIZED; N],
             len: [ZERO; N],
             ticks: Cell::new(0)
         }
@@ -335,7 +338,7 @@ impl<'a: 'static, const N: usize> Timer<'a, N> {
     }
 
     fn diff_msb(x: usize, y: usize) -> usize {
-        assert!(x != y); /* Since x != y, at least one bit is different. */
+        assert!(x != y); /* Since x != y at least one bit is different. */
         let xor = x ^ y;
         let msb = (usize::BITS - xor.leading_zeros() - 1) as usize;
         min(msb, N - 1)
@@ -365,8 +368,7 @@ impl<'a: 'static, const N: usize> Timer<'a, N> {
             let tout = actor.0.timeout.as_ref().unwrap();
             if *tout == new_ticks {
                 actor.0.timeout = None;
-                let executor = actor.0.context.take().unwrap();
-                executor.activate(actor.0.prio, actor.0.vect, actor);
+                Actor::resume(actor);
             } else {
                 let qnext = Self::diff_msb(*tout, new_ticks);
                 let qnext_len = self.len[qnext].get();
@@ -393,13 +395,10 @@ impl<'a: 'static, const N: usize> Future for TimeoutFuture<'a, N> {
         if let Some(delay) = self.delay.take() {
             if delay != 0 {
                 self.container.subscribe(delay, Ref::new(actor));
-                Poll::Pending
-            } else {
-                Poll::Ready(())
+                return Poll::Pending;
             }
-        } else {
-            Poll::Ready(())
         }
+        Poll::Ready(())
     }
 }
 
@@ -422,11 +421,9 @@ impl Linkable for Actor {
     }
 }
 
-const fn noop_raw_waker(ptr: *mut Actor) -> RawWaker {
-    const DUMMY_VTABLE: RawWakerVTable = RawWakerVTable::new(
-        |p| noop_raw_waker(p as *mut Actor), |_| {}, |_| {}, |_| {}
-    );
-
+const fn waker(ptr: *mut Actor) -> RawWaker {
+    const DUMMY_VTABLE: RawWakerVTable = 
+        RawWakerVTable::new(|p| waker(p as *mut Actor), |_| {}, |_| {}, |_| {});
     RawWaker::new(ptr as *const (), &DUMMY_VTABLE)
 }
 
@@ -445,15 +442,14 @@ impl Actor {
     }
 
     fn call(&mut self, future: &mut PinnedFuture) {
-        let raw_waker = noop_raw_waker(self);
+        let raw_waker = waker(self);
         let waker = unsafe { Waker::from_raw(raw_waker) };
         let mut cx = Context::from_waker(&waker);
         let _ = future.as_mut().poll(&mut cx);
     }
 
-    fn set<'a: 'static, T>(actor: Ref<'a, Actor>, msg: MsgRef<'a, T>) {
+    fn resume<'a: 'static>(actor: Ref<'a, Actor>) {
         let executor = actor.0.context.take().unwrap();
-        actor.0.mailbox = Some(msg.release());
         executor.activate(actor.0.prio, actor.0.vect, actor);
     }
 }
@@ -508,7 +504,7 @@ impl<'a: 'static> Executor<'a> {
 
     pub const fn new() -> Self {
         Self {
-            runq: [ List::<Actor>::UNINITIALIZED; NPRIO as usize ],
+            runq: [ List::UNINITIALIZED; NPRIO as usize ],
             futures: OnceCell::new(),
             ticket: Cell::new(0)
         }
@@ -600,20 +596,20 @@ struct ExampleMsg(u32);
 static TIMER: Timer<10> = Timer::new();
 static POOL: Pool<ExampleMsg> = Pool::new();
 
-async fn proxy(q1: &MsgQueue) -> Infallible {
+async fn proxy(q: &MsgQueue) -> Infallible {
     loop {
         TIMER.sleep_for(100).await;
         println!("woken up");
         let mut msg = POOL.get().await;
         println!("alloc");
         msg.0 = 1;
-        q1.put(msg);
+        q.put(msg);
     }
 }
 
-async fn adder(q1: &MsgQueue, sum: &mut u32) -> Infallible {
+async fn adder(q: &MsgQueue, sum: &mut u32) -> Infallible {
     loop {
-        let msg = q1.await;
+        let msg = q.await;
         println!("adder got {}", msg.0);
         *sum += msg.0;
     }
