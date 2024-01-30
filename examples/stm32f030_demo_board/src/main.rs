@@ -5,7 +5,7 @@ use core::panic::PanicInfo;
 use core::ptr::read_volatile;
 use core::ptr::write_volatile;
 use core::convert::Infallible;
-use mg::mg::{ Actor, Executor, Timer };
+use mg::mg::{ Executor, Timer };
 
 #[repr(C)]
 struct RCC {
@@ -122,6 +122,11 @@ pub fn interrupt_request(vect: u16) {
     }
 }
 
+#[no_mangle]
+pub fn interrupt_prio(_vect: u16) -> u8 {
+    0
+}
+
 unsafe fn bit_set(addr: &mut u32, bits: u32) -> () {
     let value = read_volatile(addr);
     write_volatile(addr, value | bits);
@@ -204,13 +209,9 @@ pub fn _start() -> ! {
         write_volatile(&mut systick.ctrl, 7);
     }
     
-    static mut ACTOR: Actor = Actor::new(0, 0);
-
     TIMER.init();
     let mut future = blinky();
 
-    unsafe {
-        SCHED.run([(&mut ACTOR, &mut future)]);
-    }
+    SCHED.run([(0, &mut future)]);
 }
 

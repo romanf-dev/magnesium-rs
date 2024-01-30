@@ -1,5 +1,5 @@
-Simple hardware-assisted actor model implementation in Rust
-===========================================================
+Simple hardware-assisted asynchronous micro-RTOS in Rust
+========================================================
 
 DRAFT
 
@@ -11,7 +11,7 @@ The framework relies on hardware features of the NVIC interrupt controller: the 
 When some event (hardware interrupt) occurs, it allocates and posts the message to a queue, this causes activation of the subscribed actor, moving the message into its incoming mailbox, moving the actor to the list of ready ones and also triggering interrupt vector corresponding to actor's priority. The hardware automatically transfers control to the activated vector, its handler then calls framework's function 'schedule' which eventually calls activated actors.
 
 Unlike the original version of the framework written in C, Rust version uses async functions and futures to make code more safe and readable.
-Also, it uses no external crates except core:: so it may be helpful for those who want to dive into details.
+Also, it uses no external crates except core::, no need for nightly, no macros, etc. so it may be helpful for those who want to dive into details.
 
 
 API description
@@ -53,24 +53,17 @@ Queues may be awaited using shared references:
 
         async fn foo() {
             ...
-            let msg = (&QUEUE).await;
+            let msg = QUEUE.block_on().await;
             ...
         }
 
-
-Actors are active objects representing computations over messages. They are declared with static lifetime as:
-
-        static mut ACTOR: Actor = Actor::new(<priority>, <hardware IRQ number>);
-
-
 Actors are mapped to hardware interrupts. Note that interrupt controller should be carefully adjusted to reflect IRQ:priority relations.
-Each pair (actor: IRQn) must be unique (in other words, actors may share priority but must not share interrupt vectors).
 Actor's function is the infinite loop just like thread:
 
         async fn blinky() -> Infallible {
             let q = &QUEUE;
             loop {
-                let msg = q.await;
+                let msg = q.block_on().await;
                 ...
             }
         }
@@ -91,10 +84,10 @@ The main function should contain scheduler launch as its last statement:
         let mut future = blinky();
         ...
 
-        SCHED.run(unsafe {[
-            (&mut ACTOR, &mut future)
+        SCHED.run({[
+            (<vector number 0>, &mut future)
             ...
-            (&mut <ACTOR N>, &mut <future N>)
+            (<vector number N>, &mut <future N>)
             ...
         ]});
 

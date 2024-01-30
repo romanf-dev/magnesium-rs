@@ -5,7 +5,7 @@ use core::panic::PanicInfo;
 use core::ptr::read_volatile;
 use core::ptr::write_volatile;
 use core::convert::Infallible;
-use mg::mg::{ Queue, Message, Pool, Actor, Executor };
+use mg::mg::{ Queue, Message, Pool, Executor };
 
 #[repr(C)]
 struct RCC {
@@ -84,7 +84,7 @@ struct ExampleMsg {
     n: u32
 }
 
-static POOL: Pool<ExampleMsg> = Pool::new();
+static POOL: Pool<ExampleMsg> = Pool::NEW;
 static QUEUE: Queue<ExampleMsg> = Queue::new();
 static SCHED: Executor = Executor::new();
 
@@ -103,9 +103,9 @@ fn led_control(state: bool) {
 async fn blinky() -> Infallible {
     let q = &QUEUE;
     loop {
-        let _ = q.await;        
+        let _ = q.block_on().await;        
         led_control(true);
-        let _ = q.await;
+        let _ = q.block_on().await;
         led_control(false);
     }
 }
@@ -128,6 +128,11 @@ pub fn interrupt_request(vect: u16) {
         let stir = &mut *(STIR_ADDR as *mut u32);
         write_volatile(stir, vect as u32);
     }
+}
+
+#[no_mangle]
+pub fn interrupt_prio(_vect: u16) -> u8 {
+    0
 }
 
 unsafe fn bit_set(addr: &mut u32, bits: u32) -> () {
@@ -211,13 +216,10 @@ pub fn _start() -> ! {
     
     const PROTO: Message<ExampleMsg> = Message::new(ExampleMsg { n: 0 });
     static mut MSGS: [Message<ExampleMsg>; 5] = [PROTO; 5];
-    static mut ACTOR: Actor = Actor::new(0, 0);
 
     QUEUE.init();
     let mut future = blinky();
 
-    unsafe {
-        POOL.init(&mut MSGS);
-        SCHED.run([(&mut ACTOR, &mut future)]);
-    }
+    POOL.init(unsafe { &mut MSGS });
+    SCHED.run([(0, &mut future)]);
 }
