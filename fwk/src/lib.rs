@@ -254,13 +254,13 @@ impl<'a: 'static, T: Sized> Queue<'a, T> {
         self.subscribers.init();
     }
 
-    fn get(&self, wb: WbRef<'a, T>) -> Option<(Envelope<'a, T>, WbRef<'a, T>)> {
+    fn get(&self, wb: WbRef<'a, T>) -> Option<(MsgRef<'a, T>, WbRef<'a, T>)> {
         let _lock = CriticalSection::new();
         if self.msgs.is_empty() {
             self.subscribers.enqueue(wb);
             None
         } else {
-            let msg = self.msgs.dequeue().map(Envelope::new).unwrap();
+            let msg = self.msgs.dequeue().unwrap();
             Some((msg, wb)) /* Return wb back if there is a msg. */
         }
     }
@@ -496,7 +496,7 @@ impl<'a: 'static, T> Future for QueueFuture<'a, T> {
         if let Some(wb) = self.wb.take() {
             wb.0.waker.write(cx.waker().clone());
             if let Some((msg, oldwb)) = self.source.get(wb) {
-                oldwb.0.msg = Some(msg.into());
+                oldwb.0.msg = Some(msg);
             } else {
                 return Poll::Pending
             }
