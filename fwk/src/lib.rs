@@ -85,18 +85,15 @@ impl<T> Node<T> {
         }
     }
 
-    fn unlink(&self) {
-        if let Some((prev, next)) = self.links.take() {
+    fn unlink<'a>(&self) -> Option<Ref<'a, T>> {
+        self.links.take().map(|(prev, next)| {
+            let ptr = self.payload.take().unwrap();
             unsafe {
                 (*prev).set_next(next);
                 (*next).set_prev(prev);
+                Ref::new(&mut *ptr)
             }
-        }
-    }
-
-    fn to_object<'a>(&self) -> Ref<'a, T> {
-        let ptr = self.payload.take().unwrap();
-        Ref::new(unsafe { &mut *ptr })
+        })
     }
 }
 
@@ -137,7 +134,7 @@ impl<'a, T: Linkable> List<'a, T> {
         self.peek_head_node().is_none()
     }
 
-    fn enqueue(&self, wrapper: Ref<'a, T>) {
+    fn enqueue(&self, wrapper: Ref<'a, T>) -> &Node<T> {
         let object = wrapper.release();
         let ptr: *mut T = object;
         let node = object.to_links();
@@ -146,12 +143,12 @@ impl<'a, T: Linkable> List<'a, T> {
         node.payload.set(Some(ptr));
         self.root.links.set(Some((node, next)));
         unsafe { (*prev).set_next(node); }
+        node
     }
 
     fn dequeue(&self) -> Option<Ref<'a, T>> {
         self.peek_head_node().map(|node| {
-            node.unlink();
-            node.to_object()
+            node.unlink().unwrap()
         })
     }
 }
@@ -220,26 +217,28 @@ impl<'a, T> Drop for Envelope<'a, T> {
     }
 }
 
-struct QSubscription<'a, T: Sized> {
+struct QWaitBlk<'a, T: Sized> {
     waker: MaybeUninit<Waker>,
     msg: Option<MsgRef<'a, T>>,
     linkage: Node<Self>
 }
 
-impl<'a, T> Linkable for QSubscription<'a, T> {
+impl<'a, T> Linkable for QWaitBlk<'a, T> {
     fn to_links(&self) -> &Node<Self> {
         &self.linkage
     }
 }
 
+type WbRef<'a, T> = Ref<'a, QWaitBlk<'a, T>>;
+
 struct QueueFuture<'a, T: Sized> {
     source: &'a Queue<'a, T>,
-    subscr: *mut QSubscription<'a, T>
+    wb: Option<WbRef<'a, T>>
 }
 
 pub struct Queue<'a, T: Sized> {
     msgs: List<'a, Message<'a, T>>,
-    subscribers: List<'a, QSubscription<'a, T>>
+    subscribers: List<'a, QWaitBlk<'a, T>>
 }
 
 impl<'a: 'static, T: Sized> Queue<'a, T> {
@@ -255,13 +254,14 @@ impl<'a: 'static, T: Sized> Queue<'a, T> {
         self.subscribers.init();
     }
 
-    fn get(&self, s: Ref<'a, QSubscription<'a, T>>) -> Option<Envelope<'a, T>> {
+    fn get(&self, wb: WbRef<'a, T>) -> Option<(Envelope<'a, T>, WbRef<'a, T>)> {
         let _lock = CriticalSection::new();
         if self.msgs.is_empty() {
-            self.subscribers.enqueue(s);
+            self.subscribers.enqueue(wb);
             None
         } else {
-            self.msgs.dequeue().map(Envelope::new)
+            let msg = self.msgs.dequeue().map(Envelope::new).unwrap();
+            Some((msg, wb)) /* Return wb back if there is a msg. */
         }
     }
 
@@ -270,9 +270,9 @@ impl<'a: 'static, T: Sized> Queue<'a, T> {
         if self.subscribers.is_empty() {
             self.msgs.enqueue(msg);
         } else {
-            let subscr = self.subscribers.dequeue().unwrap().release();
-            let waker = unsafe { subscr.waker.assume_init_mut() };
-            subscr.msg = Some(msg);              
+            let subscriber = self.subscribers.dequeue().unwrap().release();
+            let waker = unsafe { subscriber.waker.assume_init_mut() };
+            subscriber.msg = Some(msg);              
             waker.wake_by_ref();
         }
     }
@@ -282,12 +282,14 @@ impl<'a: 'static, T: Sized> Queue<'a, T> {
     }
     
     pub async fn block_on(&'a self) -> Envelope<'a, T> {
-        let mut qs = QSubscription { 
+        let mut wb = QWaitBlk { 
             waker: MaybeUninit::uninit(),
             msg: None,
             linkage: Node::new()
         };
-        QueueFuture { source: self, subscr: &mut qs }.await
+        let r: &'static mut QWaitBlk<T> = unsafe { mem::transmute(&mut wb) };
+        QueueFuture { source: self, wb: Some(Ref::new(r)) }.await;
+        Envelope::new(wb.msg.take().unwrap())
     }
 }
 
@@ -330,27 +332,27 @@ impl<'a: 'static, T: Sized> Pool<'a, T> {
     }
 }
 
-struct TSubscription {
+struct TWaitBlk {
     waker: MaybeUninit<Waker>,
     timeout: usize,
     linkage: Node<Self>
 }
 
-impl Linkable for TSubscription {
+impl Linkable for TWaitBlk {
     fn to_links(&self) -> &Node<Self> {
         &self.linkage
     }
 }
 
 pub struct Timer<'a, const N: usize> {
-    timers: [List<'a, TSubscription>; N],
+    timers: [List<'a, TWaitBlk>; N],
     len: [Cell<usize>; N], /* Length of the corresponding timer queue. */
     ticks: Cell<usize>
 }
 
 pub struct TimeoutFuture<'a, const N: usize> {
     container: &'a Timer<'a, N>,
-    subscr: Option<*mut TSubscription>,
+    wb: Option<Ref<'a, TWaitBlk>>,
     delay: Option<usize>
 }
 
@@ -377,7 +379,7 @@ impl<'a: 'static, const N: usize> Timer<'a, N> {
         min(msb, N - 1)
     }
     
-    fn subscribe(&self, delay: usize, subs: Ref<'a, TSubscription>) {
+    fn subscribe(&self, delay: usize, subs: Ref<'a, TWaitBlk>) {
         let _lock = CriticalSection::new();
         let ticks = self.ticks.get();
         let timeout = ticks + delay;
@@ -413,14 +415,15 @@ impl<'a: 'static, const N: usize> Timer<'a, N> {
     }
     
     pub async fn sleep_for(&'a self, t: u32) {
-        let mut subscr = TSubscription { 
+        let mut wb = TWaitBlk { 
             waker: MaybeUninit::uninit(),
             timeout: 0,
             linkage: Node::new()
         };
+        let r: &'static mut TWaitBlk = unsafe { mem::transmute(&mut wb) };
         TimeoutFuture {
             container: self,
-            subscr: Some(&mut subscr),
+            wb: Some(Ref::new(r)),
             delay: Some(t as usize)
         }.await
     }
@@ -431,9 +434,9 @@ impl<'a: 'static, const N: usize> Future for TimeoutFuture<'a, N> {
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
         if let Some(delay) = self.delay.take() {
             if delay != 0 {
-                let subscr = unsafe { &mut *self.subscr.take().unwrap() };
-                subscr.waker.write(cx.waker().clone());              
-                self.container.subscribe(delay, Ref::new(subscr));
+                let wb = self.wb.take().unwrap();
+                wb.0.waker.write(cx.waker().clone());              
+                self.container.subscribe(delay, wb);
                 return Poll::Pending;
             }
         }
@@ -488,18 +491,17 @@ impl Actor {
 }
 
 impl<'a: 'static, T> Future for QueueFuture<'a, T> {
-    type Output = Envelope<'a, T>;
+    type Output = ();
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
-        let subscr = unsafe { &mut *self.subscr };
-        if let Some(msg) = subscr.msg.take() {
-            Poll::Ready(Envelope::new(msg))
-        } else {
-            subscr.waker.write(cx.waker().clone());
-            match self.source.get(Ref::new(subscr)) {
-                Some(msg) => Poll::Ready(msg),
-                None => Poll::Pending
+        if let Some(wb) = self.wb.take() {
+            wb.0.waker.write(cx.waker().clone());
+            if let Some((msg, oldwb)) = self.source.get(wb) {
+                oldwb.0.msg = Some(msg.into());
+            } else {
+                return Poll::Pending
             }
         }
+        Poll::Ready(())
     }
 }
 
@@ -602,10 +604,11 @@ async fn proxy(q: &'static MsgQueue) -> Infallible {
     }
 }
 
-async fn adder(q: &'static MsgQueue, sum: &mut u32) -> Infallible {
+async fn adder(q: &'static MsgQueue) -> Infallible {
+    let mut sum = 0;
     loop {
         let msg = q.block_on().await;
-        *sum += msg.0;
+        sum += msg.0;
         println!("adder got {} sum = {}", msg.0, sum);
     }
 }
@@ -619,14 +622,13 @@ fn main() {
     static SCHED: Executor = Executor::new();
     let mut actor1: Actor = Actor::NEW;
     let mut actor2: Actor = Actor::NEW;
-    static mut SUM: u32 = 0;
     
     POOL.init(unsafe {&mut MSG_STORAGE});
     QUEUE.init();
     TIMER.init();
     SCHED.init();
     let mut f1 = proxy(&QUEUE);
-    let mut f2 = adder(&QUEUE, unsafe {&mut SUM});
+    let mut f2 = adder(&QUEUE);
     
     unsafe {
         SCHED.spawn(&mut actor1, &mut f1);
@@ -640,8 +642,6 @@ fn main() {
         
         SCHED.schedule(0);
     }
-
-    assert_eq!(unsafe {SUM}, 10);
 }
 }
 }
