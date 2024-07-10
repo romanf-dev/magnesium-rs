@@ -1,21 +1,26 @@
 Simple hardware-assisted asynchronous micro-RTOS in Rust
 ========================================================
 
-DRAFT
+Magnesium is a simple header-only framework implementing actor model for deeply embedded systems. It uses interrupt controller hardware for scheduling and supports preemptive multitasking. This is experimental version of the framework in Rust.
 
-Overview
---------
-
-The framework relies on hardware features of the NVIC interrupt controller: the ability to set user-defined priorities to IRQs and possibility to trigger interrupts programmatically. Actor's priorities are mapped to interrupt vectors and interrupt controller acts as a hardware scheduler. Therefore, interrupts are used as 'execution engine' for actors with certain priority. The idea is to re-use unused IRQ vectors as application actors.
-
-When some event (hardware interrupt) occurs, it allocates and posts the message to a queue, this causes activation of the subscribed actor, moving the message into its incoming mailbox, moving the actor to the list of ready ones and also triggering interrupt vector corresponding to actor's priority. The hardware automatically transfers control to the activated vector, its handler then calls framework's function 'schedule' which eventually calls activated actors.
-
-Unlike the original version of the framework written in C, Rust version uses async functions and futures to make code more safe and readable.
+Unlike the original version of the [magnesium framework](https://github.com/romanf-dev/magnesium) written in C, Rust version uses async functions and futures to make code more safe and readable.
 Also, it uses no external crates except core::, no need for nightly, no macros, etc. so it may be helpful for those who want to dive into details.
 
 
-API description
----------------
+Features
+--------
+
+- Preemptive multitasking
+- Hardware-assisted scheduling
+- Unlimited number of actors and queues
+- Message-passing communication
+- Timer facility
+- Hard real-time capability
+- Only ARMv6-M and ARMv7-M are supported at now
+
+
+API usage examples
+------------------
 
 Actor model is all about messages. Messages are declated as usual structs embedded into the Message type:
 
@@ -30,37 +35,33 @@ Actor model is all about messages. Messages are declated as usual structs embedd
 Message pools are used to allocate a message. Unsafe is required only for access to 'static mut' once during initialization.
 
         static POOL: Pool<ExampleMsg> = Pool::new();
-        ...
         POOL.init(unsafe {&mut MSG_STORAGE});
 
         
-Pools may be used by actors and interrupt handlers but they're not awaitable objects. The right object for the data exchange is the queue. Queues are just heads of
-internal intrusive lists, they have no internal storage.
+Pools may be used by actors and interrupt handlers but they're not awaitable objects. The right object for the data exchange is the queue. Queues are just heads of internal linked lists, they have no internal storage, so push always succeeds.
 
         static QUEUE: Queue<ExampleMsg> = Queue::new();
-        ...
         QUEUE.init();
 
 
-Messages should be posted to the queues using the put method to notify corresponding actors awaiting those queues.
+Messages should be posted to the queues using the 'put' method to notify corresponding actors awaiting those queues.
 
         let mut msg = POOL.alloc().unwrap();
-        ... set message payload ...
+        /* set message payload */
         QUEUE.put(msg);
 
 
 Queues may be awaited using shared references:
 
         async fn foo() {
-            ...
             let msg = QUEUE.block_on().await;
             ...
         }
 
 Actors are mapped to hardware interrupts. Note that interrupt controller should be carefully adjusted to reflect IRQ:priority relations.
-Actor's function is the infinite loop just like thread:
+Actor's function is an infinite loop just like thread:
 
-        async fn blinky() -> Infallible {
+        async fn blinky() -> ! {
             let q = &QUEUE;
             loop {
                 let msg = q.block_on().await;
@@ -69,14 +70,14 @@ Actor's function is the infinite loop just like thread:
         }
 
 
-Finally, there is executor (or scheduler) representing the set of ready-to-run actors:
+Finally, there is executor (or scheduler) representing a set of ready-to-run actors:
 
         static SCHED: Executor = Executor::new();
 
 
-It should be initialized once on startup and then called inside interrupt handlers designated to actor's execution:
+It should be initialized once on startup and then called inside interrupt handlers designated to actors execution:
 
-        SCHED.schedule(...<the current interrupt vector number>...);
+        SCHED.schedule(...<current interrupt vector number>...);
 
 
 The main function should contain scheduler launch as its last statement:
@@ -109,24 +110,21 @@ then some interrupt must provide periodic ticks using tick function:
         TIMER.tick();
 
 
-After that any actor may use sleep_for method with given amount of ticks to sleep:
+After that any actor may use sleep_for method with some amount of ticks to sleep:
 
         loop {
-            ...
             TIMER.sleep_for(10).await; // Sleep for 10 ticks.
         }
 
 
 Tick duration is unspecified and depends on your settings.
-That's it. See example folder for detailed descriptions.
 
 
 Safety notes
 ------------
 
 All the static-mut-objects are only accessed once during initialization, normal operational code of either actors or interrupts is safe and does not require unsafe code. Also the user is responsible for NVIC initialization and proper content of the vector table. 
-Executor transmutes future objects and the array of active futures into static lifetime despite they're allocated on the stack, however, since 'run' function does
-not return and all the actors are infinite loops this is considered safe.
+Executor transmutes future objects and the array of active futures into static lifetime despite they're allocated on the stack, however, since 'run' function does not return and all the actors are infinite loops this is considered safe.
 
 
 Demo
