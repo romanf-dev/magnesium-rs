@@ -304,9 +304,10 @@ impl<'a: 'static, T: Sized> Pool<'a, T> {
         slice: Cell::new(None),
     };
 
-    pub fn init<const N: usize>(&self, arr: &'a mut [Message<'a, T>; N]) {
+    pub fn init<const N: usize>(&self, arr: *mut [Message<'a, T>; N]) {
         self.pool.init();
-        self.slice.set(Some(&mut arr[0..N]));
+        let msgs = unsafe { &mut *arr };
+        self.slice.set(Some(msgs.as_mut_slice()));
     }
 
     pub async fn get(&'a self) -> Envelope<'a, T> {
@@ -588,6 +589,7 @@ fn interrupt_prio(_: u16) -> u8 { 0 }
 #[cfg(test)]
 mod tests {
 use super::*;
+use core::ptr::addr_of_mut;
 type MsgQueue = Queue<'static, ExampleMsg>;
 struct ExampleMsg(u32);
 static TIMER: Timer<10> = Timer::new();
@@ -623,7 +625,7 @@ fn main() {
     let mut actor1: Actor = Actor::NEW;
     let mut actor2: Actor = Actor::NEW;
     
-    POOL.init(unsafe {&mut MSG_STORAGE});
+    POOL.init(unsafe {addr_of_mut!(MSG_STORAGE)});
     QUEUE.init();
     TIMER.init();
     SCHED.init();
@@ -645,3 +647,4 @@ fn main() {
 }
 }
 }
+

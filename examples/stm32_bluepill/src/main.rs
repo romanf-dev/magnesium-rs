@@ -3,7 +3,7 @@
 
 use core::panic::PanicInfo;
 use core::ptr::read_volatile;
-use core::ptr::write_volatile;
+use core::ptr::{ write_volatile, addr_of_mut };
 use core::convert::Infallible;
 use mg::mg::{ Queue, Message, Pool, Executor };
 
@@ -220,6 +220,6 @@ pub fn _start() -> ! {
     QUEUE.init();
     let mut future = blinky();
 
-    POOL.init(unsafe { &mut MSGS });
+    POOL.init(unsafe { addr_of_mut!(MSGS) });
     SCHED.run([(0, &mut future)]);
 }
