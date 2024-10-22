@@ -220,6 +220,6 @@ pub fn _start() -> ! {
     QUEUE.init();
     let mut future = blinky();
 
-    POOL.init(unsafe { addr_of_mut!(MSGS) });
+    unsafe { POOL.init(addr_of_mut!(MSGS)); }
     SCHED.run([(0, &mut future)]);
 }

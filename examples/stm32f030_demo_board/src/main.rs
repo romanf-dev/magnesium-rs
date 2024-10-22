@@ -5,7 +5,8 @@ use core::panic::PanicInfo;
 use core::ptr::read_volatile;
 use core::ptr::write_volatile;
 use core::convert::Infallible;
-use mg::mg::{ Executor, Timer };
+use core::ptr::addr_of_mut;
+use mg::mg::{ Executor, Timer, Pool, Queue, Message };
 
 #[repr(C)]
 struct RCC {
@@ -79,6 +80,12 @@ pub fn _pendsv() -> ! {
     loop {}
 }
 
+struct ExampleMsg {
+    n: u32
+}
+
+static POOL: Pool<ExampleMsg> = Pool::NEW;
+static QUEUE: Queue<ExampleMsg> = Queue::new();
 static SCHED: Executor = Executor::new();
 static TIMER: Timer<10> = Timer::new();
 
@@ -94,12 +101,24 @@ fn led_control(state: bool) {
     }
 }
 
-async fn blinky() -> Infallible {
+async fn sender() -> Infallible {
     loop {
-        let _ = TIMER.sleep_for(50).await;
-        led_control(true);
-        let _ = TIMER.sleep_for(50).await;
-        led_control(false);
+        let _ = TIMER.sleep_for(100).await;
+        let mut msg = POOL.get().await;
+        msg.n = 1;
+        QUEUE.put(msg);
+        let _ = TIMER.sleep_for(100).await;
+        let mut msg = POOL.get().await;
+        msg.n = 0;
+        QUEUE.put(msg);
+    }
+}
+
+async fn receiver() -> Infallible {
+    let q = &QUEUE;
+    loop {
+        let msg = q.block_on().await;
+        led_control(msg.n == 1);
     }
 }
 
@@ -210,8 +229,17 @@ pub fn _start() -> ! {
     }
     
     TIMER.init();
-    let mut future = blinky();
+    const PROTO: Message<ExampleMsg> = Message::new(ExampleMsg { n: 0 });
+    static mut MSGS: [Message<ExampleMsg>; 5] = [PROTO; 5];
 
-    SCHED.run([(0, &mut future)]);
+    QUEUE.init();
+    unsafe { POOL.init(addr_of_mut!(MSGS)); }
+    let mut snd = sender();
+    let mut rcv = receiver();
+
+    SCHED.run([
+        (0, &mut snd),
+        (0, &mut rcv),
+    ]);
 }
 
