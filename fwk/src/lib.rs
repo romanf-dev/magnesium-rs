@@ -84,14 +84,12 @@ impl<T> Node<T> {
         }
     }
 
-    fn unlink(&self) -> Option<*const T> {
+    unsafe fn unlink(&self) -> Option<*const T> {
         self.links.take().map(|(prev, next)| {
             let ptr = self.payload.take().unwrap();
-            unsafe {
-                (*prev).set_next(next);
-                (*next).set_prev(prev);
-                ptr
-            }
+            (*prev).set_next(next);
+            (*next).set_prev(prev);
+            ptr
         })
     }
 }
@@ -118,14 +116,10 @@ impl<'a, T: Linkable> GenericList<'a, T> {
         self.root.links.set(Some((this, this)));
     }
 
-    fn peek_head(&self) -> Option<&Node<T>> {
+    fn peek_head(&self) -> Option<&'a Node<T>> {
         let (_, next) = self.root.links.get().unwrap();
         let nonempty = next != &self.root;
         nonempty.then(|| unsafe { & *next })
-    }
-
-    fn is_empty(&self) -> bool {
-        self.peek_head().is_none()
     }
 
     fn append(&self, node: &'a Node<T>) -> &'a Node<T> {
@@ -278,24 +272,16 @@ impl<'a: 'static, T: Sized> Queue<'a, T> {
 
     fn get(&self, wb: &'a QWaitBlk<'a, T>) -> Option<MsgRef<'a, T>> {
         let _lock = CriticalSection::new();
-        if self.msgs.list.is_empty() {
-            self.subscribers.enqueue(wb);
-            None
-        } else {
-            let msg = self.msgs.dequeue().unwrap();
-            Some(msg)
-        }
+        self.msgs.dequeue().or_else(|| { self.subscribers.enqueue(wb); None })
     }
 
     fn put_internal(&self, msg: MsgRef<'a, T>) {
         let _lock = CriticalSection::new();
-        if self.subscribers.list.is_empty() {
-            self.msgs.enqueue(msg);
-        } else {
-            let wait_blk = self.subscribers.dequeue().unwrap();
-            let waker = wait_blk.waker.take().unwrap();
+        if let Some(wait_blk) = self.subscribers.dequeue() {
             wait_blk.msg.set(Some(msg));
-            waker.wake_by_ref();
+            wait_blk.waker.take().unwrap().wake();
+        } else {
+            self.msgs.enqueue(msg);
         }
     }
 
@@ -328,7 +314,7 @@ impl<'a: 'static, T: Sized> Pool<'a, T> {
 
     pub unsafe fn init<const N: usize>(&self, arr: *mut [Message<'a, T>; N]) {
         self.pool.init();
-        let msgs = unsafe { &mut *arr };
+        let msgs = &mut *arr;
         self.slice.set(Some(msgs.as_mut_slice()));
     }
 
@@ -422,15 +408,14 @@ impl<'a: 'static, const N: usize> Timer<'a, N> {
         self.ticks.set(new_ticks);
 
         for _ in 0..len {
-            let subscr = self.timers[q].dequeue().unwrap();
-            let tout = subscr.timeout.get();
+            let wait_blk = self.timers[q].dequeue().unwrap();
+            let tout = wait_blk.timeout.get();
             if tout == new_ticks {
-                let waker = subscr.waker.take().unwrap();
-                waker.wake_by_ref();
+                wait_blk.waker.take().unwrap().wake();
             } else {
                 let qnext = Self::diff_msb(tout, new_ticks);
                 let qnext_len = self.len[qnext].get();
-                self.timers[qnext].enqueue(subscr);
+                self.timers[qnext].enqueue(wait_blk);
                 self.len[qnext].set(qnext_len + 1);
             }
             lock.window(); /* Timers processing preemption point. */
@@ -481,9 +466,9 @@ impl Linkable for Actor {
 
 const VTABLE: RawWakerVTable = RawWakerVTable::new(
     |p| RawWaker::new(p, &VTABLE), 
-    |_| {}, /* Wake is not used */ 
     |p| Actor::resume(unsafe { & *(p as *const Actor) }), 
-    |_| {} /* Drop is not used */
+    |_| {}, /* Wake by ref is not used */ 
+    |_| {}  /* Drop is not used */
 );
 
 impl Actor {
@@ -559,7 +544,7 @@ impl<'a: 'static> Executor<'a> {
     }
 
     unsafe fn spawn(&'a self, actor: &mut Actor, f: &mut DynFuture) {
-        let static_fut: &'static mut DynFuture = unsafe { mem::transmute(f) };
+        let static_fut: &'a mut DynFuture = unsafe { mem::transmute(f) };
         let pinned_fut = Pin::new_unchecked(static_fut);
         actor.future.set(Some(pinned_fut));
         actor.context = Some(self);
@@ -615,7 +600,6 @@ async fn proxy(q: &'static MsgQueue) -> Infallible {
         TIMER.sleep_for(100).await;
         println!("woken up");
         let mut msg = POOL.get().await;
-        println!("alloc");
         msg.0 = 1;
         q.put(msg);
     }
