@@ -7,8 +7,7 @@ scheduling and supports preemptive multitasking. This is experimental version
 of the framework in Rust.
 
 Unlike the original [magnesium framework](https://github.com/romanf-dev/magnesium) 
-written in C, Rust version uses async functions and futures to make code more safe 
-and readable.
+written in C, Rust version uses async functions and futures to make code more readable.
 Also, it uses no external crates except core::, no need for nightly, no macros, 
 etc. so it may be helpful for those who want to dive into details.
 
@@ -39,16 +38,16 @@ the Message type:
         static mut MSG_STORAGE: [Message<ExampleMsg>; 5] = [MSG_PROTOTYPE; 5];
 
 
-Message pools are used to allocate a message. Unsafe is required only for access 
-to 'static mut' once during initialization.
+Message pools are used to allocate a message. Unsafe is required only for pool 
+initialization once, as it is accessing static mut.
 Messages may be allocated either synchronously using an 'alloc' method or 
 asynchronously using a 'get'.
 
         static POOL: Pool<ExampleMsg> = Pool::new();
-        POOL.init(unsafe { addr_of_mut!(MSG_STORAGE) });
+        unsafe { POOL.init(addr_of_mut!(MSG_STORAGE)); }
 
         
-Queues are used for data exchange. Queue read is the asynchronous operation, 
+Queues are used for data exchange. Queue read is an asynchronous operation, 
 while write is always synchronous.
 
         static QUEUE: Queue<ExampleMsg> = Queue::new();
@@ -56,7 +55,7 @@ while write is always synchronous.
 
 
 Messages may be pushed into queues using the 'put' method to notify 
-corresponding actors blocked on those queues.
+corresponding actors blocked on these queues.
 
         let mut msg = POOL.alloc().unwrap();
         /* set message payload */
@@ -70,8 +69,9 @@ Queues are awaited using shared references:
             ...
         }
 
-Actors are mapped to hardware interrupts. Note that interrupt controller 
-should be carefully adjusted to reflect IRQ:priority relations.
+Actors (or message handlers) are mapped to hardware interrupts. 
+Note that the interrupt controller should be carefully adjusted to 
+reflect IRQ:priority relations.
 Actor's function is an infinite loop just like a thread:
 
         async fn blinky() -> ! {
@@ -89,7 +89,7 @@ ready-to-run actors:
         static SCHED: Executor = Executor::new();
 
 
-It have to be initialized once on startup and then called inside 
+It has to be initialized once at startup and then called inside 
 interrupt handlers designated to actors execution:
 
         SCHED.schedule(...<current interrupt vector number>...);
@@ -108,8 +108,8 @@ The main function must contain scheduler launch as its last statement:
         ]});
 
 
-Note that this function expects disabled interrupts and panics in case 
-when they are enabled since this may lead to undefined behavior.
+Note that this function expects disabled interrupts (and panics in case 
+when they are enabled) since this may lead to undefined behavior.
 
 The framework also provides timer facility. All software timers are 
 handled by single global timer object representing tick source.
@@ -142,7 +142,7 @@ Tick duration is unspecified and depends on your settings.
 Safety notes
 ------------
 
-All the static-mut-objects are only accessed once during initialization, 
+All static-mut-objects are only accessed once during initialization, 
 normal operational code of either actors or interrupts is safe and does not 
 require unsafe code. Also the user is responsible for NVIC initialization and 
 proper content of the vector table. 
