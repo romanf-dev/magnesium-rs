@@ -84,9 +84,9 @@ struct ExampleMsg {
     n: u32
 }
 
-static POOL: Pool<ExampleMsg> = Pool::NEW;
+static POOL: Pool<ExampleMsg> = Pool::new();
 static QUEUE: Queue<ExampleMsg> = Queue::new();
-static SCHED: Executor = Executor::new();
+static SCHED: Executor<1, 1> = Executor::new();
 
 fn led_control(state: bool) {
     unsafe {
@@ -123,7 +123,7 @@ pub fn _interrupt() {
 }
 
 #[no_mangle]
-pub fn interrupt_request(vect: u16) {
+pub fn interrupt_request(_cpu: u8, vect: u16) {
     unsafe {    
         let stir = &mut *(STIR_ADDR as *mut u32);
         write_volatile(stir, vect as u32);
