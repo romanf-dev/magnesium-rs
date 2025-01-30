@@ -1,7 +1,7 @@
 Simple hardware-assisted asynchronous micro-RTOS in Rust
 ========================================================
 
-Magnesium is a simple single-file framework implementing CSP-like computation 
+Magnesium is a simple framework implementing CSP-like computation 
 model for deeply embedded systems. It uses interrupt controller hardware for 
 scheduling and supports preemptive multitasking. This is experimental version 
 of the framework in Rust.
@@ -84,9 +84,11 @@ Actor's function is an infinite loop just like a thread:
 
 
 Finally, there is an executor (or scheduler) representing a set of 
-ready-to-run actors:
+ready-to-run actors. Executor has two generic parameters: number of
+priorities and number of CPUs available. Below is the example of 
+single-CPU executor supporting 10 priorities:
 
-        static SCHED: Executor = Executor::new();
+        static SCHED: Executor<10, 1> = Executor::new();
 
 
 It has to be initialized once at startup and then called inside 
@@ -114,7 +116,7 @@ when they are enabled) since this may lead to undefined behavior.
 The framework also provides timer facility. All software timers are 
 handled by single global timer object representing tick source.
 
-        static TIMER: Timer< ...number of hierarchy levels ...> = Timer::new();
+        static TIMER: Timer< number of hierarchy levels, number of CPUs > = Timer::new();
 
 
 Timers form a hierarchy based on their timeout value. Default value is 10. 
@@ -157,5 +159,4 @@ Demo
 
 The demo is a toy example with just one actor which blinks the LED. 
 Use 'make' to build.
-
 
