@@ -549,8 +549,10 @@ pub mod mg {
                 if delay != 0 {
                     self.wb.waker.set(Some(cx.waker().clone()));
                     self.container.subscribe(delay, self.wb);
-                    return Poll::Pending;
+                } else {
+                    cx.waker().clone().wake();
                 }
+                return Poll::Pending;
             }
             Poll::Ready(())
         }
@@ -723,10 +725,7 @@ pub mod mg {
                 actors = remaining;
             }
 
-            unsafe {
-                assert!(hw::interrupt_mask(0) == 1);
-            }
-
+            assert!(unsafe { hw::interrupt_mask(0) } == 1);
             loop {}
         }
     }
@@ -766,9 +765,8 @@ pub mod mg {
 
         #[test]
         fn main() {
-            static mut MSG_STORAGE: [Message<ExampleMsg>; 5] = [
-                const { Message::new(ExampleMsg(0)) }; 5
-            ];
+            static mut MSG_STORAGE: [Message<ExampleMsg>; 5] = 
+                [const { Message::new(ExampleMsg(0)) }; 5];
             static QUEUE: Queue<ExampleMsg> = Queue::new();
             static SCHED: SingleCpuExecutor<1> = Executor::new();
             let mut actor1: Actor = Actor::new();
