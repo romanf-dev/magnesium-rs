@@ -23,7 +23,6 @@ pub(crate) mod sync {
     }
 
     pub struct CriticalSection<'a> {
-        old_mask: bool,
         lock: &'a SmpProtection,
     }
 
@@ -48,15 +47,15 @@ pub(crate) mod sync {
         }
 
         pub fn new(lock: &'a SmpProtection) -> Self {
-            let old_mask = unsafe { crate::hw::interrupt_mask(true) };
+            unsafe { crate::hw::interrupt_mask(true) };
             Self::acquire(lock);
-            Self { old_mask, lock }
+            Self { lock }
         }
 
         pub fn window(&self, func: impl FnOnce()) {
             unsafe {
                 Self::release(self.lock);
-                crate::hw::interrupt_mask(self.old_mask);
+                crate::hw::interrupt_mask(false);
                 func();
                 crate::hw::interrupt_mask(true);
                 Self::acquire(self.lock);
@@ -67,7 +66,7 @@ pub(crate) mod sync {
     impl<'a> Drop for CriticalSection<'a> {
         fn drop(&mut self) {
             Self::release(self.lock);
-            unsafe { crate::hw::interrupt_mask(self.old_mask) };
+            unsafe { crate::hw::interrupt_mask(false) };
         }
     }
 }

@@ -9,24 +9,18 @@ pub(crate) mod hw {
     }
 
     #[cfg(target_arch = "arm")]
-    pub unsafe fn interrupt_mask(mask: bool) -> bool {
+    pub unsafe fn interrupt_mask(mask: bool) {
         if mask {
-            let mut primask: u32;
-            core::arch::asm!("mrs {0}, primask", "cpsid i", out(reg) primask);
-            primask != 0
+            core::arch::asm!("cpsid i");
         } else {
             core::arch::asm!("cpsie i");
-            false
         }
     }
 }
 
 #[cfg(any(test, not(target_os = "none")))]
 pub(crate) mod hw {
-    pub fn interrupt_mask(_: bool) -> bool {
-        false
-    }
-
+    pub fn interrupt_mask(_: bool) {}
     pub fn interrupt_request(_: u8, _: u16) {}
 
     pub fn interrupt_prio(_: u16) -> u8 {
@@ -42,6 +36,7 @@ mod utils {
         }
 
         pub struct SmpProtection;
+        pub struct CriticalSection;
 
         impl SmpProtection {
             pub const fn new() -> Self {
@@ -49,20 +44,15 @@ mod utils {
             }
         }
 
-        pub struct CriticalSection {
-            old_mask: bool,
-        }
-
         impl CriticalSection {
             pub fn new(_: &SmpProtection) -> Self {
-                Self {
-                    old_mask: unsafe { crate::hw::interrupt_mask(true) },
-                }
+                unsafe { crate::hw::interrupt_mask(true) };
+                Self
             }
 
             pub fn window(&self, func: impl FnOnce()) {
                 unsafe {
-                    crate::hw::interrupt_mask(self.old_mask);
+                    crate::hw::interrupt_mask(false);
                     func();
                     crate::hw::interrupt_mask(true);
                 }
@@ -71,7 +61,7 @@ mod utils {
 
         impl Drop for CriticalSection {
             fn drop(&mut self) {
-                unsafe { crate::hw::interrupt_mask(self.old_mask) };
+                unsafe { crate::hw::interrupt_mask(false) };
             }
         }
     }
@@ -91,6 +81,7 @@ pub mod mg {
     use core::mem;
     use core::ops::{Deref, DerefMut};
     use core::pin::Pin;
+    use core::ptr;
     use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
     struct Mut<'a, T>(&'a mut T); /* wrapper for muts to avoid reborrows */
@@ -106,33 +97,31 @@ pub mod mg {
     }
 
     struct Node<T> {
-        links: Cell<Option<(*const Node<T>, *const Node<T>)>>,
+        links: Cell<(*const Node<T>, *const Node<T>)>,
         payload: Cell<Option<*const T>>,
     }
 
     impl<T> Node<T> {
         const fn new() -> Self {
             Node {
-                links: Cell::new(None),
+                links: Cell::new((ptr::null(), ptr::null())),
                 payload: Cell::new(None),
             }
         }
 
         fn set_next(&self, new_next: *const Node<T>) {
-            if let Some((prev, _)) = self.links.take() {
-                self.links.set(Some((prev, new_next)));
-            }
+            let (prev, _) = self.links.get();
+            self.links.set((prev, new_next));
         }
 
         fn set_prev(&self, new_prev: *const Node<T>) {
-            if let Some((_, next)) = self.links.take() {
-                self.links.set(Some((new_prev, next)));
-            }
+            let (_, next) = self.links.get();
+            self.links.set((new_prev, next));
         }
 
         unsafe fn unlink(&self) -> Option<*const T> {
-            self.links.take().map(|(prev, next)| {
-                let ptr = self.payload.take().unwrap();
+            self.payload.take().map(|ptr| {
+                let (prev, next) = self.links.replace((ptr::null(), ptr::null()));
                 (*prev).set_next(next);
                 (*next).set_prev(prev);
                 ptr
@@ -159,19 +148,19 @@ pub mod mg {
 
         fn init(&self) {
             let this = &self.root as *const Node<T>;
-            self.root.links.set(Some((this, this)));
+            self.root.links.set((this, this));
         }
 
         fn peek_head(&self) -> Option<&'a Node<T>> {
-            let (_, next) = self.root.links.get().unwrap();
+            let (_, next) = self.root.links.get();
             let nonempty = next != &self.root;
             nonempty.then(|| unsafe { &*next })
         }
 
         fn append(&self, node: &'a Node<T>) -> &'a Node<T> {
-            let (prev, next) = self.root.links.take().unwrap();
-            node.links.set(Some((prev, &self.root)));
-            self.root.links.set(Some((node, next)));
+            let (prev, next) = self.root.links.replace((ptr::null(), ptr::null()));
+            node.links.set((prev, &self.root));
+            self.root.links.set((node, next));
             unsafe {
                 (*prev).set_next(node);
             }
@@ -697,36 +686,37 @@ pub mod mg {
             }
         }
 
-        unsafe fn spawn(&'a self, actor: &mut Actor, f: &mut DynFuture, vect: u16) {
-            let static_fut: &'a mut DynFuture = unsafe { mem::transmute(f) };
+        unsafe fn spawn(&'a self, cpu: u8, vect: u16, actor: &mut Actor, f: &mut DynFuture) {
+            let static_fut: &'a mut DynFuture = mem::transmute(f);
+            let actor: &'a mut Actor = mem::transmute(actor);
             let pinned_fut = Pin::new_unchecked(static_fut);
-            let this_cpu = unsafe { sync::cpu_this() };
-            let cpu = this_cpu as usize;
-            let prio = unsafe { hw::interrupt_prio(vect) };
-            let activation_runq = &self.per_cpu_data[cpu].runq[prio as usize];
-            let runq_lock = &self.per_cpu_data[cpu].protect;
-            let activation_data = (activation_runq, runq_lock);
-            actor.init(this_cpu, prio, vect, pinned_fut, activation_data);
-            actor.call();
+            let prio = hw::interrupt_prio(vect);
+            let cpu_data = &self.per_cpu_data[cpu as usize];
+            let activation_runq = &cpu_data.runq[prio as usize];
+            let activation_data = (activation_runq, &cpu_data.protect);
+            actor.init(cpu, prio, vect, pinned_fut, activation_data);
+            Actor::resume(actor);
         }
 
         pub fn run<const N: usize>(&'a self, mut list: [(u16, &mut DynFuture); N]) -> ! {
-            unsafe { hw::interrupt_mask(true) };
             self.init();
             let mut actors: [Actor; N] = [const { Actor::new() }; N];
             let mut actors = actors.as_mut_slice();
             let mut pairs = list.as_mut_slice();
+            let cpu = unsafe { sync::cpu_this() };
+            let runq_lock = &self.per_cpu_data[cpu as usize].protect;
+            let lock = sync::CriticalSection::new(runq_lock);
 
             while let Some((pair, rest)) = pairs.split_first_mut() {
                 let (actor, remaining) = actors.split_first_mut().unwrap();
                 unsafe {
-                    self.spawn(actor, pair.1, pair.0);
+                    self.spawn(cpu, pair.0, actor, pair.1);
                 }
                 pairs = rest;
                 actors = remaining;
             }
 
-            unsafe { hw::interrupt_mask(false) };
+            drop(lock);
             loop {}
         }
     }
@@ -782,8 +772,8 @@ pub mod mg {
 
             unsafe {
                 POOL.init(core::ptr::addr_of_mut!(MSG_STORAGE));
-                SCHED.spawn(&mut actor1, &mut f1, TEST_VECT);
-                SCHED.spawn(&mut actor2, &mut f2, TEST_VECT);
+                SCHED.spawn(0, TEST_VECT, &mut actor1, &mut f1);
+                SCHED.spawn(0, TEST_VECT, &mut actor2, &mut f2);
             }
 
             for _ in 0..10 {
