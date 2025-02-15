@@ -5,6 +5,11 @@
 pub(crate) mod sync {
     use core::sync::atomic::{AtomicBool, Ordering};
 
+    #[cfg(target_arch = "arm")]
+    extern "C" {
+        pub fn cpu_this() -> u8;
+    }
+
     pub struct SmpProtection {
         spinlock: AtomicBool,
     }
@@ -18,7 +23,7 @@ pub(crate) mod sync {
     }
 
     pub struct CriticalSection<'a> {
-        old_mask: u8,
+        old_mask: bool,
         lock: &'a SmpProtection,
     }
 
@@ -43,18 +48,17 @@ pub(crate) mod sync {
         }
 
         pub fn new(lock: &'a SmpProtection) -> Self {
-            let old_mask = unsafe { crate::hw::interrupt_mask(1) };
+            let old_mask = unsafe { crate::hw::interrupt_mask(true) };
             Self::acquire(lock);
             Self { old_mask, lock }
         }
 
         pub fn window(&self, func: impl FnOnce()) {
-            assert!(self.old_mask == 0);
             unsafe {
                 Self::release(self.lock);
-                crate::hw::interrupt_mask(0);
+                crate::hw::interrupt_mask(self.old_mask);
                 func();
-                crate::hw::interrupt_mask(1);
+                crate::hw::interrupt_mask(true);
                 Self::acquire(self.lock);
             }
         }

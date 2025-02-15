@@ -1,29 +1,30 @@
 #![cfg_attr(not(test), no_std)]
 #![allow(unused_unsafe)] /* for test stubs */
 
-#[cfg(not(test))]
+#[cfg(all(not(test), target_os = "none"))]
 pub(crate) mod hw {
     extern "C" {
-        pub fn interrupt_mask(new_mask: u8) -> u8;
         pub fn interrupt_request(cpu: u8, vector: u16);
         pub fn interrupt_prio(vector: u16) -> u8;
     }
 
-    #[cfg(feature = "smp")]
-    extern "C" {
-        pub fn cpu_this() -> u8;
-    }
-
-    #[cfg(not(feature = "smp"))]
-    pub const fn cpu_this() -> u8 {
-        0
+    #[cfg(target_arch = "arm")]
+    pub unsafe fn interrupt_mask(mask: bool) -> bool {
+        if mask {
+            let mut primask: u32;
+            core::arch::asm!("mrs {0}, primask", "cpsid i", out(reg) primask);
+            primask != 0
+        } else {
+            core::arch::asm!("cpsie i");
+            false
+        }
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, not(target_os = "none")))]
 pub(crate) mod hw {
-    pub fn interrupt_mask(_: u8) -> u8 {
-        0
+    pub fn interrupt_mask(_: bool) -> bool {
+        false
     }
 
     pub fn interrupt_request(_: u8, _: u16) {}
@@ -31,15 +32,15 @@ pub(crate) mod hw {
     pub fn interrupt_prio(_: u16) -> u8 {
         0
     }
-
-    pub fn cpu_this() -> u8 {
-        0
-    }
 }
 
 #[cfg(not(feature = "smp"))] /* single-CPU case is implemented here... */
 mod utils {
     pub mod sync {
+        pub const fn cpu_this() -> u8 {
+            0
+        }
+
         pub struct SmpProtection;
 
         impl SmpProtection {
@@ -49,22 +50,21 @@ mod utils {
         }
 
         pub struct CriticalSection {
-            old_mask: u8,
+            old_mask: bool,
         }
 
         impl CriticalSection {
             pub fn new(_: &SmpProtection) -> Self {
                 Self {
-                    old_mask: unsafe { crate::hw::interrupt_mask(1) },
+                    old_mask: unsafe { crate::hw::interrupt_mask(true) },
                 }
             }
 
             pub fn window(&self, func: impl FnOnce()) {
-                assert!(self.old_mask == 0);
                 unsafe {
-                    crate::hw::interrupt_mask(0);
+                    crate::hw::interrupt_mask(self.old_mask);
                     func();
-                    crate::hw::interrupt_mask(1);
+                    crate::hw::interrupt_mask(true);
                 }
             }
         }
@@ -519,7 +519,7 @@ pub mod mg {
         }
 
         pub fn tick(&self) {
-            let this_cpu = unsafe { hw::cpu_this() };
+            let this_cpu = unsafe { sync::cpu_this() };
             let context = &self.per_cpu_data[this_cpu as usize];
             context.tick();
         }
@@ -530,7 +530,7 @@ pub mod mg {
                 timeout: Cell::new(0),
                 linkage: Node::new(),
             };
-            let this_cpu = unsafe { hw::cpu_this() };
+            let this_cpu = unsafe { sync::cpu_this() };
             let context = &self.per_cpu_data[this_cpu as usize];
             let ref_wb: &'a TWaitBlock = unsafe { mem::transmute(&wb) };
             let future = TimeoutFuture {
@@ -691,7 +691,7 @@ pub mod mg {
         }
 
         pub fn schedule(&self, vect: u16) {
-            let this_cpu = unsafe { hw::cpu_this() as usize };
+            let this_cpu = unsafe { sync::cpu_this() as usize };
             while let Some(actor) = self.per_cpu_data[this_cpu].extract(vect) {
                 actor.call();
             }
@@ -700,7 +700,7 @@ pub mod mg {
         unsafe fn spawn(&'a self, actor: &mut Actor, f: &mut DynFuture, vect: u16) {
             let static_fut: &'a mut DynFuture = unsafe { mem::transmute(f) };
             let pinned_fut = Pin::new_unchecked(static_fut);
-            let this_cpu = unsafe { hw::cpu_this() };
+            let this_cpu = unsafe { sync::cpu_this() };
             let cpu = this_cpu as usize;
             let prio = unsafe { hw::interrupt_prio(vect) };
             let activation_runq = &self.per_cpu_data[cpu].runq[prio as usize];
@@ -711,6 +711,7 @@ pub mod mg {
         }
 
         pub fn run<const N: usize>(&'a self, mut list: [(u16, &mut DynFuture); N]) -> ! {
+            unsafe { hw::interrupt_mask(true) };
             self.init();
             let mut actors: [Actor; N] = [const { Actor::new() }; N];
             let mut actors = actors.as_mut_slice();
@@ -725,7 +726,7 @@ pub mod mg {
                 actors = remaining;
             }
 
-            assert!(unsafe { hw::interrupt_mask(0) } == 1);
+            unsafe { hw::interrupt_mask(false) };
             loop {}
         }
     }
@@ -765,7 +766,7 @@ pub mod mg {
 
         #[test]
         fn main() {
-            static mut MSG_STORAGE: [Message<ExampleMsg>; 5] = 
+            static mut MSG_STORAGE: [Message<ExampleMsg>; 5] =
                 [const { Message::new(ExampleMsg(0)) }; 5];
             static QUEUE: Queue<ExampleMsg> = Queue::new();
             static SCHED: SingleCpuExecutor<1> = Executor::new();
