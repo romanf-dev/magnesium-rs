@@ -695,7 +695,8 @@ pub mod mg {
             let activation_runq = &cpu_data.runq[prio as usize];
             let activation_data = (activation_runq, &cpu_data.protect);
             actor.init(cpu, prio, vect, pinned_fut, activation_data);
-            Actor::resume(actor);
+            activation_runq.enqueue(actor);
+            hw::interrupt_request(cpu, vect);
         }
 
         pub fn run<const N: usize>(&'a self, mut list: [(u16, &mut DynFuture); N]) -> ! {
