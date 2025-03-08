@@ -1,0 +1,7 @@
+[build]
+target = "thumbv8m.main-none-eabihf"
+
+rustflags = [
+  "-C", "link-args=-Tscript.ld -Map=mem_map.txt",
+]
+
