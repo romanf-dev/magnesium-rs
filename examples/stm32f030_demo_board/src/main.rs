@@ -5,7 +5,7 @@ use core::panic::PanicInfo;
 use core::ptr::read_volatile;
 use core::ptr::write_volatile;
 use core::convert::Infallible;
-use core::ptr::addr_of_mut;
+use core::ptr::{addr_of_mut, with_exposed_provenance_mut};
 use mg::mg::{ Executor, Timer, Pool, Queue, Message };
 
 #[repr(C)]
@@ -90,8 +90,9 @@ static SCHED: Executor<4, 1> = Executor::new();
 static TIMER: Timer<10, 1> = Timer::new();
 
 fn led_control(state: bool) {
+    let gpio_ptr = with_exposed_provenance_mut::<GPIO>(GPIO_ADDR);
     unsafe {
-        let gpio = &mut *(GPIO_ADDR as *mut GPIO);
+        let gpio = &mut *gpio_ptr;
 
         if state {
             write_volatile(&mut gpio.bsrr, GPIO_BSRR_BR4);
@@ -135,8 +136,8 @@ pub fn _interrupt() {
 
 #[no_mangle]
 pub fn interrupt_request(_cpu: u8, vect: u16) {
-    unsafe {    
-        let ispr = &mut *(ISPR_ADDR as *mut u32);
+    let ispr = with_exposed_provenance_mut::<u32>(ISPR_ADDR);
+    unsafe {
         write_volatile(ispr, 1u32 << vect);
     }
 }
@@ -158,8 +159,8 @@ unsafe fn bit_clear(addr: &mut u32, bits: u32) -> () {
 
 #[no_mangle]
 pub fn _start() -> ! {
-    let rcc_raw = 0x40021000 as *mut RCC;
-    let flash_acr = 0x40022000 as *mut u32;
+    let rcc_raw = with_exposed_provenance_mut::<RCC>(0x40021000);
+    let flash_acr = with_exposed_provenance_mut::<u32>(0x40022000);
 
     unsafe {
         let rcc = &mut *rcc_raw;
@@ -209,20 +210,19 @@ pub fn _start() -> ! {
         //
         // Enable IRQ0 to be used as actor's vector.
         //
-        let iser0 = &mut *(ISER0_ADDR as *mut u32);
+        let iser0 = with_exposed_provenance_mut::<u32>(ISER0_ADDR);
         write_volatile(iser0, 1);
 
         //
         // Configure the LED.
         //
-        let gpio = &mut *(GPIO_ADDR as *mut GPIO);
+        let gpio_ptr = with_exposed_provenance_mut::<GPIO>(GPIO_ADDR);
+        let gpio = &mut *gpio_ptr;
         bit_set(&mut rcc.ahbenr, RCC_AHBENR_GPIOAEN);
         bit_set(&mut gpio.moder, GPIO_MODER_MODER4_0);
 
-        //
-        // Configure SysTick for 100ms period.
-        //
-        let systick = &mut *(SYSTICK_ADDR as *mut SysTick);
+        let systick_ptr = with_exposed_provenance_mut::<SysTick>(SYSTICK_ADDR);
+        let systick = &mut *systick_ptr;
         write_volatile(&mut systick.load, 48000u32);
         write_volatile(&mut systick.val, 0);
         write_volatile(&mut systick.ctrl, 7);

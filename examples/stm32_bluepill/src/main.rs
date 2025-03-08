@@ -3,7 +3,7 @@
 
 use core::panic::PanicInfo;
 use core::ptr::read_volatile;
-use core::ptr::{ write_volatile, addr_of_mut };
+use core::ptr::{ write_volatile, addr_of_mut, with_exposed_provenance_mut };
 use core::convert::Infallible;
 use mg::mg::{ Queue, Message, Pool, Executor };
 
@@ -89,8 +89,9 @@ static QUEUE: Queue<ExampleMsg> = Queue::new();
 static SCHED: Executor<1, 1> = Executor::new();
 
 fn led_control(state: bool) {
+    let gpio_ptr = with_exposed_provenance_mut::<GPIO>(GPIO_ADDR);
     unsafe {
-        let gpio = &mut *(GPIO_ADDR as *mut GPIO);
+        let gpio = &mut *gpio_ptr;
 
         if state {
             write_volatile(&mut gpio.bsrr, GPIO_BSRR_BR13);
@@ -124,8 +125,8 @@ pub fn _interrupt() {
 
 #[no_mangle]
 pub fn interrupt_request(_cpu: u8, vect: u16) {
-    unsafe {    
-        let stir = &mut *(STIR_ADDR as *mut u32);
+    let stir = with_exposed_provenance_mut::<u32>(STIR_ADDR);
+    unsafe {
         write_volatile(stir, vect as u32);
     }
 }
@@ -147,8 +148,8 @@ unsafe fn bit_clear(addr: &mut u32, bits: u32) -> () {
 
 #[no_mangle]
 pub fn _start() -> ! {
-    let rcc_raw = 0x40021000 as *mut RCC;
-    let flash_acr = 0x40022000 as *mut u32;
+    let rcc_raw = with_exposed_provenance_mut::<RCC>(0x40021000);
+    let flash_acr = with_exposed_provenance_mut::<u32>(0x40022000);
 
     unsafe {
         let rcc = &mut *rcc_raw;
@@ -186,29 +187,27 @@ pub fn _start() -> ! {
         write_volatile(&mut rcc.cfgr, cfgr);
         while (read_volatile(&rcc.cfgr) & RCC_CFGR_SWS_PLL) == 0 {}
 
-        //
-        // The CPU is now running at 72MHz frequency.
-        // It is safe to disable HSI.
-        //
         bit_clear(&mut rcc.cr, RCC_CR_HSION);
 
         //
         // Enable IRQ0 to be used as actor's vector.
         //
-        let iser0 = &mut *(ISER0_ADDR as *mut u32);
-        write_volatile(iser0, 1);
+        let iser0_ptr = with_exposed_provenance_mut::<u32>(ISER0_ADDR);
+        write_volatile(iser0_ptr, 1);
 
         //
         // Configure the LED.
         //
-        let gpio = &mut *(GPIO_ADDR as *mut GPIO);
+        let gpio_ptr = with_exposed_provenance_mut::<GPIO>(GPIO_ADDR);
+        let gpio = &mut *gpio_ptr;
         bit_set(&mut rcc.apb2enr, RCC_APB2ENR_IOPCEN);
         bit_set(&mut gpio.crh, GPIO_CRH_CNF13_0 | GPIO_CRH_MODE13_1);
 
         //
         // Configure SysTick for 100ms period.
         //
-        let systick = &mut *(SYSTICK_ADDR as *mut SysTick);
+        let systick_ptr = with_exposed_provenance_mut::<SysTick>(SYSTICK_ADDR);
+        let systick = &mut *systick_ptr;
         write_volatile(&mut systick.load, 72000 * 100);
         write_volatile(&mut systick.val, 0);
         write_volatile(&mut systick.ctrl, 7);
@@ -221,5 +220,6 @@ pub fn _start() -> ! {
     let mut future = blinky();
 
     unsafe { POOL.init(addr_of_mut!(MSGS)); }
-    SCHED.run([(0, &mut future)]);
+    SCHED.run([(0, &mut future)])
 }
+
