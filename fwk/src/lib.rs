@@ -610,9 +610,7 @@ pub mod mg {
 
         fn resume<'a: 'static>(actor: &'a Actor) {
             activate(actor, actor.context.as_ref().unwrap());
-            unsafe {
-                hw::interrupt_request(actor.cpu, actor.vect);
-            }
+            unsafe { hw::interrupt_request(actor.cpu, actor.vect) }
         }
     }
 
@@ -650,9 +648,9 @@ pub mod mg {
             }
         }
 
-        fn extract(&self, vect: u16) -> Option<&'a Actor> {
+        fn extract(&self, prio: u8) -> Option<&'a Actor> {
             let _lock = sync::CriticalSection::new(&self.protect);
-            self.runq[vect as usize].dequeue()
+            self.runq[prio as usize].dequeue()
         }
     }
 
@@ -673,7 +671,7 @@ pub mod mg {
             }
         }
 
-        fn init(&self) {
+        pub fn init(&self) {
             for cpu in 0..NCPUS {
                 self.per_cpu_data[cpu].init();
             }
@@ -681,7 +679,8 @@ pub mod mg {
 
         pub fn schedule(&self, vect: u16) {
             let this_cpu = unsafe { sync::cpu_this() as usize };
-            while let Some(actor) = self.per_cpu_data[this_cpu].extract(vect) {
+            let prio = unsafe { hw::interrupt_prio(vect) };
+            while let Some(actor) = self.per_cpu_data[this_cpu].extract(prio) {
                 actor.call();
             }
         }
@@ -700,6 +699,7 @@ pub mod mg {
         }
 
         pub fn run<const N: usize>(&'a self, mut list: [(u16, &mut DynFuture); N]) -> ! {
+            #[cfg(not(feature = "smp"))]
             self.init();
             let mut actors: [Actor; N] = [const { Actor::new() }; N];
             let mut actors = actors.as_mut_slice();
