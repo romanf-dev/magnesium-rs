@@ -121,7 +121,7 @@ pub mod mg {
 
         unsafe fn unlink(&self) -> Option<*const T> {
             self.payload.take().map(|ptr| {
-                let (prev, next) = self.links.replace((ptr::null(), ptr::null()));
+                let (prev, next) = self.links.take();
                 (*prev).set_next(next);
                 (*next).set_prev(prev);
                 ptr
@@ -158,7 +158,7 @@ pub mod mg {
         }
 
         fn append(&self, node: &'a Node<T>) -> &'a Node<T> {
-            let (prev, next) = self.root.links.replace((ptr::null(), ptr::null()));
+            let (prev, next) = self.root.links.take();
             node.links.set((prev, &self.root));
             self.root.links.set((node, next));
             unsafe {
@@ -454,10 +454,9 @@ pub mod mg {
             let ticks = self.ticks.get();
             let timeout = ticks + delay;
             let q = Self::diff_msb(ticks, timeout);
-            let len = self.len[q].get();
             subs.timeout.set(timeout);
             self.timers[q].enqueue(subs);
-            self.len[q].set(len + 1);
+            self.len[q].update(|length| length + 1);
         }
 
         fn tick(&self) {
@@ -475,9 +474,8 @@ pub mod mg {
                     lock.window(|| wait_blk.waker.take().unwrap().wake());
                 } else {
                     let qnext = Self::diff_msb(tout, new_ticks);
-                    let qnext_len = self.len[qnext].get();
                     self.timers[qnext].enqueue(wait_blk);
-                    self.len[qnext].set(qnext_len + 1);
+                    self.len[qnext].update(|len| len + 1);
                     lock.window(|| {});
                 }
             }
