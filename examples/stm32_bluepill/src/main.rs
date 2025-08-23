@@ -5,10 +5,10 @@ use core::panic::PanicInfo;
 use core::ptr::read_volatile;
 use core::ptr::{ write_volatile, addr_of_mut, with_exposed_provenance_mut };
 use core::convert::Infallible;
-use mg::mg::{ Queue, Message, Pool, Executor };
+use mg::mg::{ Pic, Queue, Message, Pool, Executor };
 
 #[repr(C)]
-struct RCC {
+struct Rcc {
     cr: u32,
     cfgr: u32,
     cir: u32,
@@ -22,7 +22,7 @@ struct RCC {
 }
 
 #[repr(C)]
-struct GPIO {
+struct Gpio {
     crl: u32,
     crh: u32,
     idr: u32,
@@ -58,7 +58,7 @@ const RCC_CFGR_PLLSRC: u32 = 1 << 16;
 const RCC_CFGR_SWS_PLL: u32 = 8;
 
 const FLASH_ACR_PRFTBE: u32 = 1 << 4;
-const FLASH_ACR_LATENCY_1: u32 = 2 << 0;
+const FLASH_ACR_LATENCY_1: u32 = 2;
 
 const GPIO_ADDR: usize = 0x40011000;
 const STIR_ADDR: usize = 0xe000ef00;
@@ -84,12 +84,27 @@ struct ExampleMsg {
     n: u32
 }
 
+struct Nvic;
+
+impl Pic for Nvic {
+    fn interrupt_request(_cpu: u8, vect: u16) {
+        let stir = with_exposed_provenance_mut::<u32>(STIR_ADDR);
+        unsafe {
+            write_volatile(stir, vect as u32);
+        }
+    }
+
+    fn interrupt_prio(_vect: u16) -> u8 {
+        0
+    }
+}
+
 static POOL: Pool<ExampleMsg> = Pool::new();
 static QUEUE: Queue<ExampleMsg> = Queue::new();
-static SCHED: Executor<1, 1> = Executor::new();
+static SCHED: Executor<Nvic, 1> = Executor::new();
 
 fn led_control(state: bool) {
-    let gpio_ptr = with_exposed_provenance_mut::<GPIO>(GPIO_ADDR);
+    let gpio_ptr = with_exposed_provenance_mut::<Gpio>(GPIO_ADDR);
     unsafe {
         let gpio = &mut *gpio_ptr;
 
@@ -123,32 +138,19 @@ pub fn _interrupt() {
     SCHED.schedule(0);
 }
 
-#[no_mangle]
-pub fn interrupt_request(_cpu: u8, vect: u16) {
-    let stir = with_exposed_provenance_mut::<u32>(STIR_ADDR);
-    unsafe {
-        write_volatile(stir, vect as u32);
-    }
-}
-
-#[no_mangle]
-pub fn interrupt_prio(_vect: u16) -> u8 {
-    0
-}
-
-unsafe fn bit_set(addr: &mut u32, bits: u32) -> () {
+unsafe fn bit_set(addr: &mut u32, bits: u32) {
     let value = read_volatile(addr);
     write_volatile(addr, value | bits);
 }
 
-unsafe fn bit_clear(addr: &mut u32, bits: u32) -> () {
+unsafe fn bit_clear(addr: &mut u32, bits: u32) {
     let value = read_volatile(addr);
     write_volatile(addr, value & !bits);
 }
 
 #[no_mangle]
 pub fn _start() -> ! {
-    let rcc_raw = with_exposed_provenance_mut::<RCC>(0x40021000);
+    let rcc_raw = with_exposed_provenance_mut::<Rcc>(0x40021000);
     let flash_acr = with_exposed_provenance_mut::<u32>(0x40022000);
 
     unsafe {
@@ -198,7 +200,7 @@ pub fn _start() -> ! {
         //
         // Configure the LED.
         //
-        let gpio_ptr = with_exposed_provenance_mut::<GPIO>(GPIO_ADDR);
+        let gpio_ptr = with_exposed_provenance_mut::<Gpio>(GPIO_ADDR);
         let gpio = &mut *gpio_ptr;
         bit_set(&mut rcc.apb2enr, RCC_APB2ENR_IOPCEN);
         bit_set(&mut gpio.crh, GPIO_CRH_CNF13_0 | GPIO_CRH_MODE13_1);
@@ -212,9 +214,8 @@ pub fn _start() -> ! {
         write_volatile(&mut systick.val, 0);
         write_volatile(&mut systick.ctrl, 7);
     }
-    
-    const PROTO: Message<ExampleMsg> = Message::new(ExampleMsg { n: 0 });
-    static mut MSGS: [Message<ExampleMsg>; 5] = [PROTO; 5];
+
+    static mut MSGS: [Message<ExampleMsg>; 5] = [const { Message::new(ExampleMsg { n: 0 }) }; 5];
 
     QUEUE.init();
     let mut future = blinky();

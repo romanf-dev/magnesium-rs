@@ -3,17 +3,11 @@
 
 #[cfg(all(not(test), target_os = "none"))]
 pub(crate) mod hw {
-    extern "C" {
-        pub fn interrupt_request(cpu: u8, vector: u16);
-        pub fn interrupt_prio(vector: u16) -> u8;
-    }
-
     #[cfg(target_arch = "arm")]
     pub unsafe fn interrupt_mask(mask: bool) {
-        if mask {
-            core::arch::asm!("cpsid i");
-        } else {
-            core::arch::asm!("cpsie i");
+        match mask {
+            true => core::arch::asm!("cpsid i"),
+            false => core::arch::asm!("cpsie i"),
         }
     }
 }
@@ -21,11 +15,6 @@ pub(crate) mod hw {
 #[cfg(any(test, not(target_os = "none")))]
 pub(crate) mod hw {
     pub fn interrupt_mask(_: bool) {}
-    pub fn interrupt_request(_: u8, _: u16) {}
-
-    pub fn interrupt_prio(_: u16) -> u8 {
-        0
-    }
 }
 
 #[cfg(not(feature = "smp"))] /* single-CPU case is implemented here... */
@@ -71,13 +60,12 @@ mod utils {
 mod utils; /* multi-CPU sync is in separate file... */
 
 pub mod mg {
-    use crate::hw;
     use crate::utils::sync;
     use core::cell::Cell;
     use core::cmp::min;
     use core::convert::{Infallible, Into};
     use core::future::Future;
-    use core::marker::PhantomData;
+    use core::marker::{PhantomData, PhantomPinned};
     use core::mem;
     use core::ops::{Deref, DerefMut};
     use core::pin::Pin;
@@ -99,6 +87,7 @@ pub mod mg {
     struct Node<T> {
         links: Cell<(*const Node<T>, *const Node<T>)>,
         payload: Cell<Option<*const T>>,
+        _marker: PhantomPinned,
     }
 
     impl<T> Node<T> {
@@ -106,6 +95,7 @@ pub mod mg {
             Node {
                 links: Cell::new((ptr::null(), ptr::null())),
                 payload: Cell::new(None),
+                _marker: PhantomPinned,
             }
         }
 
@@ -120,11 +110,10 @@ pub mod mg {
         }
 
         unsafe fn unlink(&self) -> Option<*const T> {
-            self.payload.take().map(|ptr| {
+            self.payload.take().inspect(|_| {
                 let (prev, next) = self.links.take();
                 (*prev).set_next(next);
                 (*next).set_prev(prev);
-                ptr
             })
         }
     }
@@ -482,7 +471,7 @@ pub mod mg {
         }
     }
 
-    pub struct Timer<'a, const N: usize, const NCPUS: usize> {
+    pub struct Timer<'a, const N: usize = 10, const NCPUS: usize = 1> {
         per_cpu_data: [PerCpuTimer<'a, N>; NCPUS],
     }
 
@@ -547,15 +536,17 @@ pub mod mg {
 
     type DynFuture = dyn Future<Output = Infallible> + 'static;
     type PinnedFuture = Pin<&'static mut DynFuture>;
-    type Runqueue<'a> = ListRef<'a, Actor>;
-    type ActivationData<'a> = (&'a Runqueue<'a>, &'a sync::SmpProtection);
+
+    trait Dispatcher<'a, T> {
+        fn activate(&'a self, actor: &'a T);
+    }
 
     struct Actor {
         prio: u8,
         cpu: u8,
         vect: u16,
         future: Cell<Option<PinnedFuture>>,
-        context: Option<ActivationData<'static>>,
+        context: Option<&'static dyn Dispatcher<'static, Self>>,
         linkage: Node<Self>,
     }
 
@@ -583,13 +574,13 @@ pub mod mg {
             prio: u8,
             vect: u16,
             fut: PinnedFuture,
-            target: ActivationData<'static>,
+            parent: &'static dyn Dispatcher<'static, Self>,
         ) {
             self.vect = vect;
             self.cpu = cpu;
             self.prio = prio;
             self.future.set(Some(fut));
-            self.context = Some(target);
+            self.context = Some(parent);
         }
 
         fn call(&self) {
@@ -606,9 +597,8 @@ pub mod mg {
             let _ = fut.as_mut().unwrap().as_mut().poll(&mut cx);
         }
 
-        fn resume<'a: 'static>(actor: &'a Actor) {
-            activate(actor, actor.context.as_ref().unwrap());
-            unsafe { hw::interrupt_request(actor.cpu, actor.vect) }
+        fn resume(actor: &'static Actor) {
+            actor.context.as_ref().unwrap().activate(actor);
         }
     }
 
@@ -627,12 +617,22 @@ pub mod mg {
         }
     }
 
-    struct PerCpuExecutor<'a, const NPRIO: usize> {
-        runq: [Runqueue<'a>; NPRIO],
+    trait Prioritized {
+        fn get_prio(&self) -> usize;
+    }
+
+    impl Prioritized for Actor {
+        fn get_prio(&self) -> usize {
+            self.prio as usize
+        }
+    }
+
+    struct PerCpuContainer<'a, const NPRIO: usize, T: Linkable + Prioritized> {
+        runq: [ListRef<'a, T>; NPRIO],
         protect: sync::SmpProtection,
     }
 
-    impl<'a, const NPRIO: usize> PerCpuExecutor<'a, NPRIO> {
+    impl<'a, const NPRIO: usize, T: Linkable + Prioritized> PerCpuContainer<'a, NPRIO, T> {
         const fn new() -> Self {
             Self {
                 runq: [const { ListRef::new() }; NPRIO],
@@ -646,26 +646,33 @@ pub mod mg {
             }
         }
 
-        fn extract(&self, prio: u8) -> Option<&'a Actor> {
+        fn extract(&self, prio: u8) -> Option<&'a T> {
             let _lock = sync::CriticalSection::new(&self.protect);
             self.runq[prio as usize].dequeue()
         }
+
+        fn insert(&self, item: &'a T) {
+            let _lock = sync::CriticalSection::new(&self.protect);
+            let prio = item.get_prio();
+            self.runq[prio].enqueue(item);
+        }
     }
 
-    fn activate<'a>(actor: &'a Actor, target: &ActivationData<'a>) {
-        let (target_runq, protect) = target;
-        let _lock = sync::CriticalSection::new(protect);
-        target_runq.enqueue(actor);
+    pub trait Pic {
+        fn interrupt_request(cpu: u8, vector: u16);
+        fn interrupt_prio(vector: u16) -> u8;
     }
 
-    pub struct Executor<'a, const NPRIO: usize, const NCPUS: usize> {
-        per_cpu_data: [PerCpuExecutor<'a, NPRIO>; NCPUS],
+    pub struct Executor<'a, IC: Pic, const NPRIO: usize, const NCPUS: usize = 1> {
+        per_cpu_data: [PerCpuContainer<'a, NPRIO, Actor>; NCPUS],
+        _pic: PhantomData<IC>,
     }
 
-    impl<'a: 'static, const NPRIO: usize, const NCPUS: usize> Executor<'a, NPRIO, NCPUS> {
+    impl<'a: 'static, IC: Pic, const NPRIO: usize, const NCPUS: usize> Executor<'a, IC, NPRIO, NCPUS> {
         pub const fn new() -> Self {
             Self {
-                per_cpu_data: [const { PerCpuExecutor::<NPRIO>::new() }; NCPUS],
+                per_cpu_data: [const { PerCpuContainer::<NPRIO, Actor>::new() }; NCPUS],
+                _pic: PhantomData,
             }
         }
 
@@ -677,7 +684,7 @@ pub mod mg {
 
         pub fn schedule(&self, vect: u16) {
             let this_cpu = unsafe { sync::cpu_this() as usize };
-            let prio = unsafe { hw::interrupt_prio(vect) };
+            let prio = IC::interrupt_prio(vect);
             while let Some(actor) = self.per_cpu_data[this_cpu].extract(prio) {
                 actor.call();
             }
@@ -685,21 +692,17 @@ pub mod mg {
 
         unsafe fn spawn(&'a self, cpu: u8, vect: u16, actor: &mut Actor, f: &mut DynFuture) {
             let static_fut: &'a mut DynFuture = mem::transmute(f);
-            let actor: &'a mut Actor = mem::transmute(actor);
             let pinned_fut = Pin::new_unchecked(static_fut);
-            let prio = hw::interrupt_prio(vect);
-            let cpu_data = &self.per_cpu_data[cpu as usize];
-            let activation_runq = &cpu_data.runq[prio as usize];
-            let activation_data = (activation_runq, &cpu_data.protect);
-            actor.init(cpu, prio, vect, pinned_fut, activation_data);
-            activation_runq.enqueue(actor);
-            hw::interrupt_request(cpu, vect);
+            let actor: &'a mut Actor = mem::transmute(actor);
+            let prio = IC::interrupt_prio(vect);
+            actor.init(cpu, prio, vect, pinned_fut, self);
+            self.activate(actor);
         }
 
         pub fn run<const N: usize>(&'a self, mut list: [(u16, &mut DynFuture); N]) -> ! {
             #[cfg(not(feature = "smp"))]
             self.init();
-            let mut actors: [Actor; N] = [const { Actor::new() }; N];
+            let mut actors = [const { Actor::new() }; N];
             let mut actors = actors.as_mut_slice();
             let mut pairs = list.as_mut_slice();
             let cpu = unsafe { sync::cpu_this() };
@@ -720,9 +723,15 @@ pub mod mg {
         }
     }
 
-    pub type SingleCpuExecutor<'a, const NPRIO: usize> = Executor<'a, NPRIO, 1>;
-    pub type SingleCpuTimer<'a, const N: usize> = Timer<'a, N, 1>;
-    unsafe impl<const NPRIO: usize, const NCPUS: usize> Sync for Executor<'_, NPRIO, NCPUS> {}
+    impl<'a: 'static, IC: Pic, const NPRIO: usize, const NCPUS: usize> Dispatcher<'a, Actor> for Executor<'a, IC, NPRIO, NCPUS> {
+        fn activate(&'a self, actor: &'a Actor) {
+            let container = &self.per_cpu_data[actor.cpu as usize];
+            container.insert(actor);
+            IC::interrupt_request(actor.cpu, actor.vect);
+        }
+    }
+
+    unsafe impl<IC: Pic, const NPRIO: usize, const NCPUS: usize> Sync for Executor<'_, IC, NPRIO, NCPUS> {}
     unsafe impl<T: Send> Sync for Queue<'_, T> {}
     unsafe impl<T: Send> Sync for Pool<'_, T> {}
     unsafe impl<const N: usize, const NCPUS: usize> Sync for Timer<'_, N, NCPUS> {}
@@ -732,7 +741,7 @@ pub mod mg {
         use super::*;
         type MsgQueue = Queue<'static, ExampleMsg>;
         struct ExampleMsg(u32);
-        static TIMER: SingleCpuTimer<10> = Timer::new();
+        static TIMER: Timer = Timer::new();
         static POOL: Pool<ExampleMsg> = Pool::new();
 
         async fn proxy(q: &'static MsgQueue) -> Infallible {
@@ -753,12 +762,18 @@ pub mod mg {
             }
         }
 
+        struct DummyPic;
+
+        impl Pic for DummyPic {
+            fn interrupt_request(_cpu: u8, _vector: u16) {}
+            fn interrupt_prio(_vector: u16) -> u8 { 0 }
+        }
+
         #[test]
         fn main() {
-            static mut MSG_STORAGE: [Message<ExampleMsg>; 5] =
-                [const { Message::new(ExampleMsg(0)) }; 5];
+            static mut MSG_STORAGE: [Message<ExampleMsg>; 5] = [const { Message::new(ExampleMsg(0)) }; 5];
             static QUEUE: Queue<ExampleMsg> = Queue::new();
-            static SCHED: SingleCpuExecutor<1> = Executor::new();
+            static SCHED: Executor<DummyPic, 1> = Executor::new();
             let mut actor1: Actor = Actor::new();
             let mut actor2: Actor = Actor::new();
             const TEST_VECT: u16 = 0;

@@ -4,7 +4,7 @@
 use core::panic::PanicInfo;
 use core::convert::Infallible;
 use core::ptr::addr_of_mut;
-use mg::mg::{ Executor, Timer, Pool, Queue, Message };
+use mg::mg::{ Pic, Executor, Timer, Pool, Queue, Message };
 
 mod periph;
 mod ipi;
@@ -42,16 +42,6 @@ pub fn doorbell_isr() {
 }
 
 #[unsafe(no_mangle)]
-pub fn interrupt_request(cpu: u8, vect: u16) {
-    ipi::request(cpu, vect);
-}
-
-#[unsafe(no_mangle)]
-pub fn interrupt_prio(vector: u16) -> u8 {
-    periph::nvic_vect2prio(vector)
-}
-
-#[unsafe(no_mangle)]
 pub fn cpu_this() -> u8 {
     periph::cpu_this() as u8
 }
@@ -63,11 +53,23 @@ fn cpu_init() {
     periph::nvic_interrupt_enable(periph::DOORBELL_IRQ);
 }
 
+struct Nvic;
+
+impl Pic for Nvic {
+    fn interrupt_request(cpu: u8, vect: u16) {
+        ipi::request(cpu, vect);
+    }
+
+    fn interrupt_prio(vector: u16) -> u8 {
+        periph::nvic_vect2prio(vector)
+    }
+}
+
 struct ExampleMsg(u32);
 
 static POOL: Pool<ExampleMsg> = Pool::new();
 static QUEUE: Queue<ExampleMsg> = Queue::new();
-static SCHED: Executor<4, CPU_MAX> = Executor::new();
+static SCHED: Executor<Nvic, 4, CPU_MAX> = Executor::new();
 static TIMER: Timer<10, CPU_MAX> = Timer::new();
 
 async fn sender() -> Infallible {
