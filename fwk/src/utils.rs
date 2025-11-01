@@ -2,8 +2,46 @@
  * Multiprocessor synchronization primitives. Only used when feature=smp.
  */
 
+#[cfg(not(feature = "smp"))] /* single-CPU case is implemented here... */
 pub(crate) mod sync {
-    use core::sync::atomic::{AtomicBool, Ordering};
+    pub const fn cpu_this() -> u8 {
+        0
+    }
+
+    pub struct SmpProtection;
+    pub struct CriticalSection;
+
+    impl SmpProtection {
+        pub const fn new() -> Self {
+            Self
+        }
+    }
+
+    impl CriticalSection {
+        pub fn new(_: &SmpProtection) -> Self {
+            unsafe { crate::hw::interrupt_mask(true) };
+            Self
+        }
+
+        pub fn window(&self, func: impl FnOnce()) {
+            unsafe {
+                crate::hw::interrupt_mask(false);
+                func();
+                crate::hw::interrupt_mask(true);
+            }
+        }
+    }
+
+    impl Drop for CriticalSection {
+        fn drop(&mut self) {
+            unsafe { crate::hw::interrupt_mask(false) };
+        }
+    }
+}
+
+#[cfg(feature = "smp")]
+pub(crate) mod sync {
+    use core::sync::atomic::{ AtomicBool, Ordering };
 
     #[cfg(target_arch = "arm")]
     extern "C" {

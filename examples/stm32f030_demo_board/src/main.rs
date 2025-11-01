@@ -6,7 +6,7 @@ use core::ptr::read_volatile;
 use core::ptr::write_volatile;
 use core::convert::Infallible;
 use core::ptr::{addr_of_mut, with_exposed_provenance_mut};
-use mg::mg::{ Pic, Executor, Timer, Pool, Queue, Message };
+use mg::{Pool, Pic, Executor, Message, Channel, Timer};
 
 #[repr(C)]
 struct Rcc {
@@ -100,7 +100,7 @@ impl Pic for Nvic {
 }
 
 static POOL: Pool<ExampleMsg> = Pool::new();
-static QUEUE: Queue<ExampleMsg> = Queue::new();
+static CHAN: Channel<ExampleMsg> = Channel::new();
 static SCHED: Executor<Nvic, 4> = Executor::new();
 static TIMER: Timer = Timer::new();
 
@@ -122,16 +122,16 @@ async fn sender() -> Infallible {
         let _ = TIMER.sleep_for(100).await;
         let mut msg = POOL.get().await;
         msg.n = 1;
-        QUEUE.put(msg);
+        CHAN.put(msg);
         let _ = TIMER.sleep_for(100).await;
         let mut msg = POOL.get().await;
         msg.n = 0;
-        QUEUE.put(msg);
+        CHAN.put(msg);
     }
 }
 
 async fn receiver() -> Infallible {
-    let q = &QUEUE;
+    let q = &CHAN;
     loop {
         let msg = q.block_on().await;
         led_control(msg.n == 1);
@@ -233,7 +233,7 @@ pub fn _start() -> ! {
     TIMER.init();
     static mut MSGS: [Message<ExampleMsg>; 5] = [const { Message::new(ExampleMsg { n: 0 }) }; 5];
 
-    QUEUE.init();
+    CHAN.init();
     unsafe { POOL.init(addr_of_mut!(MSGS)); }
     let mut snd = sender();
     let mut rcv = receiver();

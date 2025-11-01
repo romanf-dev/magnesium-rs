@@ -5,7 +5,7 @@ use core::panic::PanicInfo;
 use core::ptr::read_volatile;
 use core::ptr::{ write_volatile, addr_of_mut, with_exposed_provenance_mut };
 use core::convert::Infallible;
-use mg::mg::{ Pic, Queue, Message, Pool, Executor };
+use mg::{ Pic, Channel, Message, Pool, Executor };
 
 #[repr(C)]
 struct Rcc {
@@ -100,7 +100,7 @@ impl Pic for Nvic {
 }
 
 static POOL: Pool<ExampleMsg> = Pool::new();
-static QUEUE: Queue<ExampleMsg> = Queue::new();
+static CHAN: Channel<ExampleMsg> = Channel::new();
 static SCHED: Executor<Nvic, 1> = Executor::new();
 
 fn led_control(state: bool) {
@@ -117,7 +117,7 @@ fn led_control(state: bool) {
 }
 
 async fn blinky() -> Infallible {
-    let q = &QUEUE;
+    let q = &CHAN;
     loop {
         let _ = q.block_on().await;        
         led_control(true);
@@ -130,7 +130,7 @@ async fn blinky() -> Infallible {
 pub fn _systick() {
     let mut msg = POOL.alloc().unwrap();
     msg.n = 1;
-    QUEUE.put(msg);
+    CHAN.put(msg);
 }
 
 #[no_mangle]
@@ -217,7 +217,7 @@ pub fn _start() -> ! {
 
     static mut MSGS: [Message<ExampleMsg>; 5] = [const { Message::new(ExampleMsg { n: 0 }) }; 5];
 
-    QUEUE.init();
+    CHAN.init();
     let mut future = blinky();
 
     unsafe { POOL.init(addr_of_mut!(MSGS)); }

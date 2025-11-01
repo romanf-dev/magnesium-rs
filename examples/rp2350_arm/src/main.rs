@@ -4,7 +4,7 @@
 use core::panic::PanicInfo;
 use core::convert::Infallible;
 use core::ptr::addr_of_mut;
-use mg::mg::{ Pic, Executor, Timer, Pool, Queue, Message };
+use mg::{ Pic, Executor, Timer, Pool, Channel, Message };
 
 mod periph;
 mod ipi;
@@ -68,7 +68,7 @@ impl Pic for Nvic {
 struct ExampleMsg(u32);
 
 static POOL: Pool<ExampleMsg> = Pool::new();
-static QUEUE: Queue<ExampleMsg> = Queue::new();
+static CHAN: Channel<ExampleMsg> = Channel::new();
 static SCHED: Executor<Nvic, 4, CPU_MAX> = Executor::new();
 static TIMER: Timer<10, CPU_MAX> = Timer::new();
 
@@ -77,12 +77,12 @@ async fn sender() -> Infallible {
         let _ = TIMER.sleep_for(1000).await;
         let mut msg = POOL.get().await;
         msg.0 = 0;
-        QUEUE.put(msg);
+        CHAN.put(msg);
     }
 }
 
 async fn receiver() -> Infallible {
-    let q = &QUEUE;
+    let q = &CHAN;
     loop {
         let _ = q.block_on().await;
         periph::led_toggle();
@@ -100,7 +100,7 @@ pub fn _start() -> ! {
     periph::led_config();
     SCHED.init();
     TIMER.init();
-    QUEUE.init();
+    CHAN.init();
 
     static mut MSGS: [Message<ExampleMsg>; 5] = [const { Message::new(ExampleMsg(0)) }; 5];
     unsafe { POOL.init(addr_of_mut!(MSGS)); }
