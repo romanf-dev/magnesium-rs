@@ -5,7 +5,7 @@ use core::panic::PanicInfo;
 use core::ptr::read_volatile;
 use core::ptr::{ write_volatile, addr_of_mut, with_exposed_provenance_mut };
 use core::convert::Infallible;
-use mg::{ Pic, Channel, Message, Pool, Executor };
+use mg::{ Pic, Channel, Message, Pool, Executor, bind };
 
 #[repr(C)]
 struct Rcc {
@@ -218,9 +218,14 @@ pub fn _start() -> ! {
     static mut MSGS: [Message<ExampleMsg>; 5] = [const { Message::new(ExampleMsg { n: 0 }) }; 5];
 
     CHAN.init();
-    let mut future = blinky();
 
-    unsafe { POOL.init(addr_of_mut!(MSGS)); }
-    SCHED.run([(0, &mut future)])
+    unsafe { 
+        POOL.init(addr_of_mut!(MSGS));
+    }
+
+    let actor = bind!(blinky, 0, 0);
+    SCHED.init();
+    SCHED.run([actor]);
+    loop {}
 }
 

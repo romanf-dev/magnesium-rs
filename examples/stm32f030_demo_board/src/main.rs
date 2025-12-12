@@ -6,7 +6,7 @@ use core::ptr::read_volatile;
 use core::ptr::write_volatile;
 use core::convert::Infallible;
 use core::ptr::{addr_of_mut, with_exposed_provenance_mut};
-use mg::{Pool, Pic, Executor, Message, Channel, Timer};
+use mg::{Pool, Pic, Executor, Message, Channel, Timer, bind};
 
 #[repr(C)]
 struct Rcc {
@@ -235,12 +235,11 @@ pub fn _start() -> ! {
 
     CHAN.init();
     unsafe { POOL.init(addr_of_mut!(MSGS)); }
-    let mut snd = sender();
-    let mut rcv = receiver();
 
-    SCHED.run([
-        (0, &mut snd),
-        (0, &mut rcv),
-    ]);
+    SCHED.init();
+    let actor1 = bind!(sender, 0, 0);
+    let actor2 = bind!(receiver, 0, 0);
+    SCHED.run([ actor1, actor2 ]);
+    loop {}
 }
 

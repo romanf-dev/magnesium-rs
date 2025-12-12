@@ -3,9 +3,7 @@
  */
 
 use core::marker::PhantomData;
-use core::mem;
-use core::pin::Pin;
-use crate::actor::{ Actor, DynFuture };
+use crate::actor::{Actor, RefWrapper};
 use crate::list::{ QueueRef, Linkable };
 use crate::utils::sync;
 
@@ -13,21 +11,17 @@ pub(crate) trait Dispatcher<'a, T> {
     fn activate(&'a self, actor: &'a T);
 }
 
-pub(crate) trait Prioritized {
-    fn get_prio(&self) -> usize;
-}
-
 pub trait Pic {
     fn interrupt_request(cpu: u8, vector: u16);
     fn interrupt_prio(vector: u16) -> u8;
 }
 
-struct PerCpuContainer<'a, const NPRIO: usize, T: Linkable + Prioritized> {
+struct PerCpuContainer<'a, const NPRIO: usize, T: Linkable> {
     runq: [QueueRef<'a, T>; NPRIO],
     protect: sync::SmpProtection,
 }
 
-impl<'a, const NPRIO: usize, T: Linkable + Prioritized> PerCpuContainer<'a, NPRIO, T> {
+impl<'a, const NPRIO: usize, T: Linkable> PerCpuContainer<'a, NPRIO, T> {
     const fn new() -> Self {
         Self {
             runq: [const { QueueRef::new() }; NPRIO],
@@ -46,9 +40,8 @@ impl<'a, const NPRIO: usize, T: Linkable + Prioritized> PerCpuContainer<'a, NPRI
         self.runq[prio as usize].dequeue()
     }
 
-    fn insert(&self, item: &'a T) {
+    fn insert(&self, item: &'a T, prio: usize) {
         let _lock = sync::CriticalSection::new(&self.protect);
-        let prio = item.get_prio();
         self.runq[prio].enqueue(item);
     }
 }
@@ -80,43 +73,29 @@ impl<'a: 'static, IC: Pic, const NPRIO: usize, const NCPUS: usize> Executor<'a, 
         }
     }
 
-    pub(crate) unsafe fn spawn(&'a self, cpu: u8, vect: u16, actor: &mut Actor, f: &mut DynFuture) {
-        let static_fut: &'a mut DynFuture = mem::transmute(f);
-        let pinned_fut = Pin::new_unchecked(static_fut);
-        let actor: &'a mut Actor = mem::transmute(actor);
-        let prio = IC::interrupt_prio(vect);
-        actor.init(cpu, prio, vect, pinned_fut, self);
+    fn spawn(&'a self, this_cpu: u8, actor: &'a Actor) {
+        let prio = IC::interrupt_prio(actor.vect);
+        assert!(prio == actor.prio);
+        assert!(this_cpu == actor.cpu);
+        actor.set_parent(self);
         self.activate(actor);
     }
 
-    pub fn run<const N: usize>(&'a self, mut list: [(u16, &mut DynFuture); N]) -> ! {
-        #[cfg(not(feature = "smp"))]
-        self.init();
-        let mut actors = [const { Actor::new() }; N];
-        let mut actors = actors.as_mut_slice();
-        let mut pairs = list.as_mut_slice();
+    pub fn run<const N: usize>(&'a self, actors: [RefWrapper<Actor>; N]) {
         let cpu = unsafe { sync::cpu_this() };
         let runq_lock = &self.per_cpu_data[cpu as usize].protect;
-        let lock = sync::CriticalSection::new(runq_lock);
+        let _lock = sync::CriticalSection::new(runq_lock);
 
-        while let Some((pair, rest)) = pairs.split_first_mut() {
-            let (actor, remaining) = actors.split_first_mut().unwrap();
-            unsafe {
-                self.spawn(cpu, pair.0, actor, pair.1);
-            }
-            pairs = rest;
-            actors = remaining;
+        for i in 0..N {
+            self.spawn(cpu, actors[i].0);
         }
-
-        drop(lock);
-        loop {}
     }
 }
 
-impl<'a: 'static, IC: Pic, const NPRIO: usize, const NCPUS: usize> Dispatcher<'a, Actor> for Executor<'a, IC, NPRIO, NCPUS> {
+impl<'a: 'static, IC: Pic, const NPRIO: usize, const NCPUS: usize>Dispatcher<'a, Actor> for Executor<'a, IC, NPRIO, NCPUS> {
     fn activate(&'a self, actor: &'a Actor) {
         let container = &self.per_cpu_data[actor.cpu as usize];
-        container.insert(actor);
+        container.insert(actor, actor.prio as usize);
         IC::interrupt_request(actor.cpu, actor.vect);
     }
 }

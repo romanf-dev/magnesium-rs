@@ -4,7 +4,7 @@
 use core::panic::PanicInfo;
 use core::convert::Infallible;
 use core::ptr::addr_of_mut;
-use mg::{ Pic, Executor, Timer, Pool, Channel, Message };
+use mg::{ Pic, Executor, Timer, Pool, Channel, Message, bind };
 
 mod periph;
 mod ipi;
@@ -91,8 +91,9 @@ async fn receiver() -> Infallible {
 
 fn core1_entry() -> ! {
     cpu_init();
-    let mut rcv = receiver();
-    SCHED.run([ (SCHED_VECT, &mut rcv) ])
+    let actor = mg::bind!(receiver, SCHED_VECT, 0, 1);
+    SCHED.run([ actor ]);
+    loop {}
 }
 
 #[unsafe(no_mangle)]
@@ -105,10 +106,11 @@ pub fn _start() -> ! {
     static mut MSGS: [Message<ExampleMsg>; 5] = [const { Message::new(ExampleMsg(0)) }; 5];
     unsafe { POOL.init(addr_of_mut!(MSGS)); }
 
-    let mut snd = sender();
+    let actor = bind!(sender, SCHED_VECT, 0);
 
     cpu_init();
     periph::core1_start(core1_entry);
-    SCHED.run([ (SCHED_VECT, &mut snd) ])
+    SCHED.run([ actor ]);
+    loop {}
 }
 

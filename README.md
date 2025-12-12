@@ -8,8 +8,8 @@ of the framework in Rust.
 
 Unlike the original [magnesium framework](https://github.com/romanf-dev/magnesium) 
 written in C, Rust version uses async functions and futures to make code more readable.
-Also, it uses no external crates except core::, no need for nightly, no macros, 
-etc. so it may be helpful for those who want to dive into details.
+Also, it uses no external crates except core::, no need for nightly, no procedural
+macros, etc. so it may be helpful for those who want to dive into details.
 
 
 Features
@@ -76,7 +76,7 @@ Note that the interrupt controller should be carefully adjusted to
 reflect IRQ->priority relations.
 Actor's function is an infinite loop just like a thread:
 
-        async fn blinky() -> ! {
+        async fn blinky() -> Infallible {
             let q = &CHAN;
             loop {
                 let msg = q.block_on().await;
@@ -84,34 +84,39 @@ Actor's function is an infinite loop just like a thread:
             }
         }
 
-There are no restrictions on actor functions: they may accept any parameters, may be 
-generic, etc.
-
 Finally, there is an executor (or scheduler) representing a set of 
-ready-to-run actors. Executor has two generic parameters: number of
-priorities and number of CPUs available. Below is an example of 
-single-CPU executor supporting 10 priorities:
+ready-to-run actors. Executor has three generic parameters: 
+    - Interrupt controller interface implementing the Pic trait
+    - the number of priorities
+    - number of CPUs available (optional, default = 1)
 
-        static SCHED: Executor<10, 1> = Executor::new();
+The Pic trait consists of two functions:
+
+        fn interrupt_request(cpu: u8, vector: u16);
+        fn interrupt_prio(vector: u16) -> u8;
+
+The first one is used to mark hardware interrupt with the corresponding
+vector on the target CPU as pending. The second one maps interrupt
+vector to its priority. Default implementations for the NVIC are 
+provided in the examples.
+
+Below is an example of single-CPU executor supporting 10 priorities:
+
+        static SCHED: Executor<NVIC, 10> = Executor::new();
 
 
 It has to be initialized once at startup and then called inside 
 interrupt handlers designated to actors execution:
-
+        
         SCHED.schedule(...<current interrupt vector number>...);
 
 
 The main function must contain scheduler launch as its last statement:
 
-        let mut future = blinky();
-        ...
-
-        SCHED.run({[
-            (<vector number 0>, &mut future)
-            ...
-            (<vector number N>, &mut <future N>)
-            ...
-        ]});
+        SCHED.init();
+        let my_actor = bind!(blinky, TEST_VECT, <priority of TEST_VECT>);
+        SCHED.run([ actor1 ]);
+        loop {}
 
 
 Note that this function expects disabled interrupts (and panics in case 
@@ -152,10 +157,6 @@ All static-mut-objects are only accessed once during initialization,
 normal operational code of either actors or interrupts is safe and does not 
 require unsafe code. Also the user is responsible for NVIC initialization and 
 proper content of the vector table. 
-Executor transmutes future objects and the array of active futures into 
-static lifetime despite they're allocated on the stack, however, since 'run' 
-function does not return and all the actors are infinite loops this is 
-considered safe.
 
 
 Demo
